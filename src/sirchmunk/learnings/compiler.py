@@ -776,6 +776,24 @@ class KnowledgeCompiler:
 
         return result
 
+    @staticmethod
+    def _is_generic_summary(summary: str, min_specificity_len: int = 80) -> bool:
+        """Check whether a summary is too generic to be useful for retrieval.
+
+        A generic summary typically contains only structural descriptions
+        (e.g., "This document contains several sections") without specific
+        content indicators.  Detection uses summary length and information
+        density as domain-agnostic proxies.
+        """
+        if not summary:
+            return True
+        stripped = summary.strip()
+        if len(stripped) < min_specificity_len:
+            return True
+        # Count unique substantive words (>4 chars) as a proxy for specificity
+        words = set(w.lower() for w in stripped.split() if len(w) > 4)
+        return len(words) < 8
+
     async def _extract_summary(
         self,
         file_path: str,
@@ -786,13 +804,19 @@ class KnowledgeCompiler:
 
         When a tree is available its root already contains an LLM-synthesized
         summary (produced by ``_synthesize_root_summary`` during tree build),
-        so we reuse it directly — no redundant LLM call.
+        so we reuse it directly — unless the summary is too generic (Plan 2),
+        in which case we fall back to multi-section LLM summarization.
 
         For large documents without a tree, uses multi-section sampling
         (beginning, middle, end) to capture the full scope of the document.
         """
         if tree and tree.root and tree.root.summary:
-            return tree.root.summary
+            if not self._is_generic_summary(tree.root.summary):
+                return tree.root.summary
+            await self._log.info(
+                f"[Compile] Root summary too generic for {Path(file_path).name}, "
+                f"falling back to LLM summarization"
+            )
 
         preview = self._build_summary_preview(content)
         from sirchmunk.llm.prompts import COMPILE_DOC_SUMMARY

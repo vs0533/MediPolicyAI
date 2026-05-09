@@ -2166,7 +2166,7 @@ class AgenticSearch(BaseSearch):
         ".css", ".bash", ".java", ".c", ".cpp", ".h", ".go", ".rs",
     }
     _FAST_CONTEXT_WINDOW = 30  # ± lines around each grep hit
-    _FAST_MAX_EVIDENCE_CHARS = 15_000
+    _FAST_MAX_EVIDENCE_CHARS = 20_000  # Plan 5: expanded from 15K to accommodate richer table evidence
     _FAST_SMALL_FILE_THRESHOLD = 100_000  # 100K chars - read full file instead of grep sampling
 
     # --- Wiki-enhanced ranking constants ---
@@ -2220,6 +2220,20 @@ class AgenticSearch(BaseSearch):
     """Max chars of tree root summary in Step 1 structure hints."""
     _CHAR_RANGE_MAX_SPAN_RATIO: float = 0.8
     """char_range spanning more than this ratio of the document is treated as invalid."""
+
+    # --- Tree navigation retry (Plan 3) ---
+    _NAV_RETRY_MIN_EVIDENCE_CHARS: int = 200
+    """Evidence below this length triggers a retry with expanded results."""
+    _NAV_RETRY_EXPANDED_RESULTS: int = 8
+    """Expanded max_results for retry navigation pass."""
+
+    # --- Table evidence budgets (Plan 5) ---
+    _TABLE_EVIDENCE_DEFAULT_CHARS: int = 10_000
+    """Default max_chars for _format_table_evidence (was 6000)."""
+    _TABLE_EVIDENCE_PER_RANGE_CHARS: int = 8_000
+    """Max chars for per-page-range table supplement in tree nav (was 4000)."""
+    _TABLE_EVIDENCE_STANDALONE_CHARS: int = 12_000
+    """Max chars for standalone table digest fallback when tree nav evidence is thin."""
 
     # --- Self-correction expanded sampling ---
     _SELF_CORRECT_EXPANDED_NAV_RESULTS: int = 10
@@ -4087,6 +4101,19 @@ class AgenticSearch(BaseSearch):
         return span_ratio < self._CHAR_RANGE_MAX_SPAN_RATIO
 
     @staticmethod
+    def _is_evidence_sufficient(evidence: str, min_chars: int = 0) -> bool:
+        """Check whether collected evidence has enough substance to answer a query.
+
+        Uses a length threshold as a lightweight, domain-agnostic proxy.
+        Empty or near-empty evidence (e.g., only headers with no data)
+        fails the check, triggering a retry with expanded parameters.
+        """
+        if not evidence:
+            return False
+        stripped = evidence.strip()
+        return len(stripped) >= min_chars
+
+    @staticmethod
     def _load_compile_content(
         work_path: Path, file_path: str,
     ) -> Optional[str]:
@@ -4195,7 +4222,7 @@ class AgenticSearch(BaseSearch):
     @staticmethod
     def _format_table_evidence(
         tables: List[Dict[str, Any]],
-        max_chars: int = 6000,
+        max_chars: int = 10_000,
         query: str = "",
     ) -> str:
         """Format table digest entries as LLM-friendly evidence text.
@@ -4440,10 +4467,63 @@ class AgenticSearch(BaseSearch):
                                 parts, fname, lf, lf.summary,
                             )
 
+        # ── Plan 3: Retry with expanded results if evidence is insufficient ──
+        # Triggers on: (a) zero evidence parts, OR (b) evidence too thin.
+        _current_ev_text = "\n\n".join(parts)
+        _needs_retry = (
+            max_results < self._NAV_RETRY_EXPANDED_RESULTS
+            and not self._is_evidence_sufficient(
+                _current_ev_text, self._NAV_RETRY_MIN_EVIDENCE_CHARS,
+            )
+        )
+        if _needs_retry:
+            try:
+                retry_leaves = await indexer.navigate(
+                    tree, query,
+                    max_results=self._NAV_RETRY_EXPANDED_RESULTS,
+                )
+                if retry_leaves:
+                    r_page, r_char, r_summary = self._classify_leaves(retry_leaves)
+                    for rl in r_summary:
+                        self._append_evidence_part(parts, fname, rl, rl.summary)
+
+                    # Page-level extraction for retry (mirrors Phase 2)
+                    if r_page:
+                        r_all_pages: set = set()
+                        for _rl, (rsp, rep) in r_page:
+                            r_all_pages.update(range(rsp, rep + 1))
+                        try:
+                            r_page_contents = DocumentExtractor.extract_pages(
+                                file_path, sorted(r_all_pages),
+                            )
+                            r_page_map = {pc.page_number: pc.content for pc in r_page_contents}
+                            for rl, (rsp, rep) in r_page:
+                                r_seg = [r_page_map[p] for p in range(rsp, rep + 1) if r_page_map.get(p, "").strip()]
+                                if r_seg:
+                                    self._append_evidence_part(parts, fname, rl, "\n".join(r_seg))
+                        except Exception:
+                            pass
+
+                    # Char-range extraction for retry (mirrors Phase 3)
+                    if r_char:
+                        r_text = self._load_compile_content(self.work_path, file_path) or ""
+                        for rl in r_char:
+                            s, e = rl.char_range
+                            if self._is_valid_char_range(s, e, len(r_text)) and r_text:
+                                seg = r_text[s:e]
+                                if seg.strip():
+                                    self._append_evidence_part(parts, fname, rl, seg)
+
+                    leaves = retry_leaves
+                    print(f"SEARCH_WIKI_DEBUG [N3.1] retry_nav: {len(retry_leaves)} leaves", flush=True)
+            except Exception:
+                pass
+
         if not parts:
             return None
 
         # Supplement with table evidence if available
+        _all_tables = None
         try:
             from sirchmunk.utils.file_utils import get_fast_hash
             _file_hash = get_fast_hash(file_path)
@@ -4465,7 +4545,8 @@ class AgenticSearch(BaseSearch):
                             )
                             if leaf_tables:
                                 table_text = self._format_table_evidence(
-                                    leaf_tables, max_chars=4000,
+                                    leaf_tables,
+                                    max_chars=self._TABLE_EVIDENCE_PER_RANGE_CHARS,
                                     query=query,
                                 )
                                 if table_text:
@@ -4475,9 +4556,28 @@ class AgenticSearch(BaseSearch):
         except Exception:
             pass
 
-        print(f"SEARCH_WIKI_DEBUG [N5] table_supplement: tables_loaded={len(_all_tables) if '_all_tables' in dir() and _all_tables else 0}", flush=True)
-
+        # Plan 3: If evidence is still too thin, add full table digest as standalone
         evidence = "\n\n".join(parts)
+        if (
+            not self._is_evidence_sufficient(
+                evidence, self._NAV_RETRY_MIN_EVIDENCE_CHARS,
+            )
+            and _all_tables
+        ):
+            standalone_table_ev = self._format_table_evidence(
+                _all_tables,
+                max_chars=self._TABLE_EVIDENCE_STANDALONE_CHARS,
+                query=query,
+            )
+            if standalone_table_ev:
+                parts.append(
+                    f"[{fname} - Standalone Table Evidence]\n{standalone_table_ev}"
+                )
+                evidence = "\n\n".join(parts)
+                print(f"SEARCH_WIKI_DEBUG [N5.1] standalone_table_fallback: len={len(standalone_table_ev)}", flush=True)
+
+        print(f"SEARCH_WIKI_DEBUG [N5] table_supplement: tables_loaded={len(_all_tables) if _all_tables else 0}", flush=True)
+
         print(f"SEARCH_WIKI_DEBUG [N6] _navigate_tree_for_evidence result: len={len(evidence) if evidence else 0}", flush=True)
         await self._logger.info(
             f"[FAST:TreeNav] Extracted {len(parts)} sections, "

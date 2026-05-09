@@ -46,6 +46,10 @@ _TREE_PREVIEW_MIN = 12_000    # Minimum preview window (chars)
 _TREE_PREVIEW_MAX = 50_000    # Maximum preview window (~12K tokens)
 _TREE_PREVIEW_RATIO = 0.15    # Fraction of document to preview
 
+# Structured content detection thresholds (Plan 1: generic table recognition)
+_STRUCT_MD_TABLE_MIN_ROWS = 3       # Min markdown table rows to classify as structured
+_STRUCT_NUMERIC_DENSITY_THRESHOLD = 0.20  # Fraction of numeric tokens in a text segment
+
 # Extensions eligible for tree indexing
 _TREE_EXTENSIONS = {
     ".pdf", ".docx", ".doc", ".md", ".markdown",
@@ -445,6 +449,9 @@ class DocumentTreeIndexer:
         # Merge consecutive fragment entries into virtual parents
         toc_entries = self._merge_fragment_entries(toc_entries)
 
+        # Plan 4: Group disproportionately large tail entries (exhibits/appendices)
+        toc_entries = self._merge_supplementary_entries(toc_entries)
+
         seen_ids: set = set()
         children = self._toc_entries_to_nodes(
             toc_entries, content, len(content), seen_ids,
@@ -465,6 +472,74 @@ class DocumentTreeIndexer:
             page_range=root_page_range,
             children=children,
         )
+
+    @staticmethod
+    def _merge_supplementary_entries(entries: List[Any]) -> List[Any]:
+        """Merge tail entries with disproportionately large spans into a virtual parent.
+
+        Detects when the last few entries collectively span much more content
+        than the preceding entries — a generic structural signal for exhibits,
+        appendices, or attachment sections.  Groups them under a single
+        navigable node to prevent them from dominating tree navigation.
+
+        Uses only structural signals (char span ratios, position in document)
+        — no domain-specific keywords.  Returns original entries when the
+        structural pattern is not detected or when too few entries remain.
+        """
+        if len(entries) < 4:
+            return entries
+
+        def _span(e: Any) -> int:
+            if hasattr(e, 'char_start') and hasattr(e, 'char_end'):
+                if e.char_end and e.char_start is not None:
+                    return max(0, e.char_end - e.char_start)
+            return 0
+
+        spans = [_span(e) for e in entries]
+        total_span = sum(spans)
+        if total_span == 0:
+            return entries
+
+        # Scan backwards to find tail entries whose cumulative span is
+        # disproportionately large while individually being much larger
+        # than the body-section baseline.  Uses 25th percentile instead of
+        # median so that many large tail entries cannot inflate the baseline.
+        non_zero_spans = [s for s in spans if s > 0]
+        if len(non_zero_spans) < 4:
+            return entries
+        sorted_spans = sorted(non_zero_spans)
+        q25_idx = max(0, len(sorted_spans) // 4)
+        baseline_span = sorted_spans[q25_idx]
+
+        tail_start = len(entries)
+        cumulative = 0
+        for i in range(len(entries) - 1, 0, -1):
+            if spans[i] > baseline_span * 3:
+                cumulative += spans[i]
+                tail_start = i
+            else:
+                break
+
+        tail_count = len(entries) - tail_start
+        # Require at least 2 tail entries spanning > 40% of total content
+        if tail_count < 2 or cumulative / total_span < 0.40:
+            return entries
+
+        # Also ensure enough primary entries remain
+        if tail_start < 2:
+            return entries
+
+        from copy import deepcopy
+        first_tail = entries[tail_start]
+        last_tail = entries[-1]
+        merged = deepcopy(first_tail)
+        merged.title = f"Supplementary Material ({tail_count} sections)"
+        if hasattr(last_tail, 'char_end') and last_tail.char_end:
+            merged.char_end = last_tail.char_end
+        merged.children = list(entries[tail_start:])
+
+        result = list(entries[:tail_start]) + [merged]
+        return result if len(result) >= 2 else entries
 
     @staticmethod
     def _merge_fragment_entries(entries: List[Any]) -> List[Any]:
@@ -591,10 +666,19 @@ class DocumentTreeIndexer:
                     total_pages=total_pages,
                 )
 
+            # Plan 1: Detect structured/tabular content and add navigation hint
+            # to help LLM-driven navigation prioritize data-rich sections.
+            # Deliberately keeps content_type="text" so _classify_leaves
+            # routes to kreuzberg char_range (higher fidelity than pypdf).
+            summary_text = section_text.strip()
+            section_sample = content[start:min(start + 2000, end)]
+            if DocumentTreeIndexer._detect_structured_content(section_sample):
+                summary_text = f"[Data/Tables] {summary_text}"
+
             node = TreeNode(
                 node_id=nid,
                 title=entry.title,
-                summary=section_text.strip(),
+                summary=summary_text,
                 char_range=(start, end),
                 level=level,
                 page_range=page_range,
@@ -635,6 +719,44 @@ class DocumentTreeIndexer:
             if content_length >= threshold:
                 return depth
         return 2  # minimum depth
+
+    @staticmethod
+    def _detect_structured_content(text: str, sample_size: int = 2000) -> bool:
+        """Detect whether text contains structured/tabular data using generic signals.
+
+        Uses two high-precision, domain-agnostic heuristics (any triggers True):
+          1. Markdown table syntax (pipe-delimited rows with separator line)
+          2. High numeric token density (currency, percentages, large numbers)
+
+        Intentionally omits lower-precision signals (multi-space alignment,
+        tab counts) because PDF-extracted text frequently has irregular
+        spacing that causes false positives.
+
+        Args:
+            text: Content segment to analyze.
+            sample_size: Max chars to analyze (avoids scanning huge sections).
+        """
+        sample = text[:sample_size]
+        if not sample.strip():
+            return False
+
+        # Signal 1: Markdown table syntax — pipe-separated rows with header separator
+        pipe_lines = [ln for ln in sample.split("\n") if ln.strip().startswith("|")]
+        separator_lines = [ln for ln in pipe_lines if re.match(r"\|\s*[-:]+", ln)]
+        data_rows = len(pipe_lines) - len(separator_lines)
+        if data_rows >= _STRUCT_MD_TABLE_MIN_ROWS and separator_lines:
+            return True
+
+        # Signal 2: Numeric token density — high ratio of numeric-pattern tokens
+        non_ws = re.sub(r"\s+", "", sample)
+        if len(non_ws) > 50:
+            from sirchmunk.learnings.compiler import _NUM_TOKEN_RE
+            num_tokens = _NUM_TOKEN_RE.findall(sample)
+            total_chars = sum(len(t) for t in num_tokens)
+            if total_chars / len(non_ws) >= _STRUCT_NUMERIC_DENSITY_THRESHOLD:
+                return True
+
+        return False
 
     async def _build_node(
         self, text: str, level: int, max_depth: int,
@@ -691,13 +813,74 @@ class DocumentTreeIndexer:
             children=children,
         )
 
+    @staticmethod
+    def _collect_representative_nodes(
+        children: List[TreeNode],
+        max_nodes: int = 15,
+    ) -> List[TreeNode]:
+        """Collect representative nodes from multiple tree depths.
+
+        Gathers direct children plus a sample of deeper descendants to
+        ensure the summary captures actual content topics — not just
+        top-level structural wrappers that may be uninformative.
+
+        Strategy:
+          - Layer 1: all direct children (structural overview).
+          - Layer 2+: BFS preferring **leaf nodes** (actual content topics)
+            over intermediate nodes (whose summaries overlap children).
+        """
+        reps: List[TreeNode] = []
+        seen: set = set()
+
+        # Layer 1: all direct children (even wrappers — they provide structure)
+        for c in children:
+            if c.node_id not in seen and len(reps) < max_nodes:
+                reps.append(c)
+                seen.add(c.node_id)
+
+        # Layer 2+: BFS collecting leaf nodes with substantive summaries.
+        # Leaf nodes represent actual content sections; intermediate nodes
+        # often have summaries that redundantly overlap their children.
+        queue = []
+        for c in children:
+            for gc in c.children:
+                queue.append(gc)
+
+        while queue and len(reps) < max_nodes:
+            node = queue.pop(0)
+            if node.node_id in seen:
+                continue
+
+            is_leaf = not node.children
+            has_substance = (
+                (node.summary and len(node.summary.strip()) > 20)
+                or node.table_count > 0
+            )
+
+            if is_leaf and has_substance:
+                reps.append(node)
+                seen.add(node.node_id)
+            elif not is_leaf:
+                # Expand intermediate nodes without adding them —
+                # their content is represented by their leaf descendants.
+                for ch in node.children:
+                    queue.append(ch)
+
+        return reps
+
     async def _synthesize_root_summary(self, children: List[TreeNode]) -> str:
-        """Synthesize a document-level summary from children's section summaries."""
+        """Synthesize a document-level summary from multi-depth section info.
+
+        Gathers representative nodes from multiple tree depths to produce
+        a summary that reflects actual document content, not just top-level
+        wrapper headings like "SEC Filing" or "Table of Contents".
+        """
         if not children:
             return ""
         from sirchmunk.llm.prompts import COMPILE_SYNTHESIZE_SUMMARY
+        representatives = self._collect_representative_nodes(children)
         sections_text = "\n".join(
-            f"- {c.title}: {c.summary}" for c in children
+            f"- {n.title}: {n.summary}" for n in representatives
         )
         prompt = COMPILE_SYNTHESIZE_SUMMARY.format(sections=sections_text)
         resp = await self._llm.achat([{"role": "user", "content": prompt}])
