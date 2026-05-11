@@ -1242,6 +1242,22 @@ def cmd_mcp_version(args: argparse.Namespace) -> int:
 # sirchmunk compile
 # ------------------------------------------------------------------
 
+
+def _configure_compile_threads() -> None:
+    """Set sensible thread-count defaults for CPU-bound ML workloads.
+
+    Must be called early — before PyTorch, OpenMP, or kreuzberg's Rust
+    core are imported — so the environment variables are read at library
+    init time.  User-provided overrides are always respected.
+    """
+    cpu_count = os.cpu_count() or 4
+    cap = str(max(1, min(cpu_count // 2, 4)))
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                "RAYON_NUM_THREADS"):
+        if var not in os.environ:
+            os.environ[var] = cap
+
+
 def cmd_compile(args: argparse.Namespace) -> int:
     """Compile document collections into structured knowledge indices.
 
@@ -1254,6 +1270,10 @@ def cmd_compile(args: argparse.Namespace) -> int:
     Returns:
         Exit code (0 for success, non-zero for failure)
     """
+    # Cap thread counts BEFORE heavy libraries are imported, so OpenMP/MKL
+    # read the correct values at init time.  User-set vars are respected.
+    _configure_compile_threads()
+
     try:
         work_path = Path(
             getattr(args, "work_path", None) or str(_get_default_work_path())

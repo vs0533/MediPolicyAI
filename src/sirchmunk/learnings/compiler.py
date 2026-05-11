@@ -384,21 +384,19 @@ class KnowledgeCompiler:
 
     @staticmethod
     def _configure_thread_limits() -> None:
-        """Cap PyTorch / OpenMP / MKL thread count to avoid runaway CPU and memory.
+        """Cap PyTorch thread count to reduce per-thread memory allocation.
 
-        Only sets defaults when the user has not already configured them via
-        environment variables, so explicit overrides are always respected.
-        The cap is half the available CPU cores, clamped to [1, 4].
+        Environment variables (OMP_NUM_THREADS, etc.) are set in the CLI
+        entry point before libraries are imported.  This method handles the
+        PyTorch-specific runtime API that works retroactively.
         """
         cpu_count = os.cpu_count() or 4
-        cap = str(max(1, min(cpu_count // 2, 4)))
-        for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
-            if var not in os.environ:
-                os.environ[var] = cap
+        cap = max(1, min(cpu_count // 2, 4))
         try:
             import torch
-            torch.set_num_threads(int(cap))
-        except ImportError:
+            torch.set_num_threads(cap)
+            torch.set_num_interop_threads(max(1, cap // 2))
+        except (ImportError, RuntimeError):
             pass
 
     # ------------------------------------------------------------------ #
@@ -651,6 +649,10 @@ class KnowledgeCompiler:
 
         When *shallow* is True (or file is ineligible for tree indexing),
         the pipeline skips tree building and summarises via a direct LLM call.
+
+        Large intermediate objects (extraction output, enriched content,
+        raw tables) are explicitly released after their last use to keep
+        per-file peak memory bounded.
         """
         result = FileCompileResult(path=entry.path)
         print(f"SEARCH_WIKI_DEBUG [C1] _compile_single_file: file_path={entry.path}, file_hash={entry.file_hash}", flush=True)
@@ -666,6 +668,11 @@ class KnowledgeCompiler:
                 result.error = "Insufficient text content"
                 return result
 
+            # Extract scalar metadata from extraction before releasing it
+            page_count = extraction.page_count
+            raw_tables = extraction.tables
+            del extraction
+
             use_tree = (
                 not shallow
                 and DocumentTreeIndexer.should_build_tree(entry.path, len(content))
@@ -677,7 +684,7 @@ class KnowledgeCompiler:
                 from sirchmunk.learnings.toc_extractor import TOCExtractor
                 toc_entries = await TOCExtractor.extract(
                     entry.path, content,
-                    total_pages=extraction.page_count,
+                    total_pages=page_count,
                 )
                 if toc_entries:
                     await self._log.info(
@@ -689,47 +696,53 @@ class KnowledgeCompiler:
                 result.tree = await self._tree_indexer.build_tree(
                     entry.path, content,
                     toc_entries=toc_entries,
-                    total_pages=extraction.page_count,
+                    total_pages=page_count,
                 )
 
-            # Record TOC / tree metrics on the result for manifest persistence
-            result.has_explicit_toc = toc_entries is not None and len(toc_entries) > 0
+            result.has_explicit_toc = bool(toc_entries)
+            del toc_entries
             result.tree_node_count = self._count_tree_nodes(result.tree)
             print(f"SEARCH_WIKI_DEBUG [C2] tree_build: success={result.tree is not None}, nodes={result.tree_node_count}, tree.file_path={result.tree.file_path if result.tree else 'N/A'}", flush=True)
 
-            # Enrich content with structural metadata for non-text types
+            # --- Summary + topics + evidence (needs content) ---
             ext = Path(entry.path).suffix.lower()
             evidence_digest = ""
 
             if ext in (".xlsx", ".xls"):
-                # Excel: use adaptive sampling for both metadata and evidence
                 metadata_prefix, evidence_digest = self._extract_xlsx_sampling(entry.path)
-                enriched_content = metadata_prefix + content if metadata_prefix else content
             else:
                 metadata_prefix = self._extract_structured_metadata(entry.path, content)
-                enriched_content = metadata_prefix + content if metadata_prefix else content
 
-            result.summary = await self._extract_summary(
-                entry.path, enriched_content, result.tree,
-            )
+            # Build enriched_content only for the summary LLM call, then release
+            if metadata_prefix:
+                result.summary = await self._extract_summary(
+                    entry.path, metadata_prefix + content, result.tree,
+                )
+            else:
+                result.summary = await self._extract_summary(
+                    entry.path, content, result.tree,
+                )
+            del metadata_prefix
+
             result.topics = await self._extract_topics(result.summary)
             result.evidence = self._build_evidence(entry, content, result)
 
-            # Persist Excel evidence digest for search-time consumption
+            # Persist Excel evidence digest
             if evidence_digest.strip():
                 try:
                     digest_dir = self._compile_dir / "xlsx_digests"
                     digest_dir.mkdir(parents=True, exist_ok=True)
                     file_hash = get_fast_hash(entry.path) or ""
                     if file_hash:
-                        digest_path = digest_dir / f"{file_hash}.txt"
-                        digest_path.write_text(evidence_digest, encoding="utf-8")
+                        (digest_dir / f"{file_hash}.txt").write_text(
+                            evidence_digest, encoding="utf-8",
+                        )
                         result.has_xlsx_digest = True
                 except Exception:
                     pass
+            del evidence_digest
 
-            # Cache compile-time ENHANCED content so search can slice
-            # char_range from the same text the tree was built from.
+            # Cache ENHANCED content to disk
             try:
                 file_hash_content = get_fast_hash(entry.path) or ""
                 if file_hash_content and content:
@@ -741,83 +754,84 @@ class KnowledgeCompiler:
             except Exception:
                 pass
 
-            # Persist table digest for documents with extracted tables
-            if extraction.tables:
+            # --- Table digest + integration (needs raw_tables, then release) ---
+            if raw_tables:
                 try:
-                    table_digest = self._build_table_digest(extraction.tables)
+                    table_digest = self._build_table_digest(raw_tables)
                     if table_digest:
                         digest_dir = self._compile_dir / "table_digests"
                         digest_dir.mkdir(parents=True, exist_ok=True)
                         file_hash = get_fast_hash(entry.path) or ""
                         if file_hash:
-                            digest_path = digest_dir / f"{file_hash}.json"
-                            digest_path.write_text(
+                            (digest_dir / f"{file_hash}.json").write_text(
                                 json.dumps(table_digest, ensure_ascii=False),
                                 encoding="utf-8",
                             )
                             result.has_table_digest = True
-                            result.table_count = len(extraction.tables)
+                            result.table_count = len(raw_tables)
                 except Exception:
                     pass
 
+                if result.tree and result.tree.root:
+                    self._integrate_tables_into_tree(
+                        result.tree.root, raw_tables,
+                        content=content, total_pages=page_count,
+                    )
+
             print(f"SEARCH_WIKI_DEBUG [C3] table_digest: generated={result.has_table_digest}, count={result.table_count}", flush=True)
+            del raw_tables
 
-            # Integrate tables into tree: annotate counts + create table child nodes
-            if result.tree and result.tree.root and extraction.tables:
-                self._integrate_tables_into_tree(
-                    result.tree.root, extraction.tables,
-                    content=content, total_pages=extraction.page_count,
-                )
-
-            # Phase 2.5: Targeted table extraction via tree-node structural signals
-            if result.tree and result.tree.root and ext == ".pdf":
-                targeted_tables = await self._targeted_table_extraction(
-                    entry.path, result.tree,
-                )
-                await self._supplement_table_digest(
-                    entry.path, targeted_tables, result,
-                    source_label="Targeted extraction",
-                )
-
-            # Phase 2.6: Content-based full-page table scan (tree-independent)
-            if ext == ".pdf" and extraction.page_count:
-                covered_pages = self._get_covered_table_pages(entry.path)
-                tree_root = (
-                    result.tree.root
-                    if result.tree and result.tree.root else None
-                )
-                content_tables = await self._content_based_table_scan(
-                    entry.path,
-                    extraction.page_count,
-                    covered_pages,
-                    enhanced_content=content,
-                    tree_root=tree_root,
-                )
-                await self._supplement_table_digest(
-                    entry.path, content_tables, result,
-                    source_label="Content-based scan",
-                )
-
-            # Phase 2.7: Selective force-OCR for high-density gap pages
-            if ext == ".pdf" and extraction.page_count:
-                covered_after_scan = self._get_covered_table_pages(entry.path)
-                gap_pages = self._find_force_ocr_candidates(
-                    entry.path, extraction.page_count, covered_after_scan,
-                )
-                if gap_pages:
-                    ocr_tables = await self._selective_force_ocr_tables(
-                        entry.path, gap_pages,
+            # --- Phases 2.5-2.8: secondary table extraction (PDF only) ---
+            # These phases re-read from the PDF file; `content` is only
+            # needed for Phase 2.6 fallback and Phase 2.8 enrichment.
+            if ext == ".pdf":
+                if result.tree and result.tree.root:
+                    targeted_tables = await self._targeted_table_extraction(
+                        entry.path, result.tree,
                     )
                     await self._supplement_table_digest(
-                        entry.path, ocr_tables, result,
-                        source_label="Selective force-OCR",
+                        entry.path, targeted_tables, result,
+                        source_label="Targeted extraction",
+                    )
+                    del targeted_tables
+
+                if page_count:
+                    covered_pages = self._get_covered_table_pages(entry.path)
+                    tree_root = (
+                        result.tree.root
+                        if result.tree and result.tree.root else None
+                    )
+                    content_tables = await self._content_based_table_scan(
+                        entry.path, page_count, covered_pages,
+                        enhanced_content=content, tree_root=tree_root,
+                    )
+                    await self._supplement_table_digest(
+                        entry.path, content_tables, result,
+                        source_label="Content-based scan",
+                    )
+                    del content_tables
+
+                    covered_after_scan = self._get_covered_table_pages(entry.path)
+                    gap_pages = self._find_force_ocr_candidates(
+                        entry.path, page_count, covered_after_scan,
+                    )
+                    if gap_pages:
+                        ocr_tables = await self._selective_force_ocr_tables(
+                            entry.path, gap_pages,
+                        )
+                        await self._supplement_table_digest(
+                            entry.path, ocr_tables, result,
+                            source_label="Selective force-OCR",
+                        )
+                        del ocr_tables
+
+                if result.has_table_digest:
+                    self._enrich_table_digest_content(
+                        entry.path, content, tree_root=None,
                     )
 
-            # Phase 2.8: Enrich targeted-extraction tables with ENHANCED content
-            if ext == ".pdf" and result.has_table_digest:
-                self._enrich_table_digest_content(
-                    entry.path, content, tree_root=None,
-                )
+            # Content is no longer needed — release before returning
+            del content
 
         except Exception as exc:
             result.error = str(exc)
