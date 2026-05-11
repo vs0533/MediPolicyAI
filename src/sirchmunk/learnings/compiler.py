@@ -458,8 +458,10 @@ class KnowledgeCompiler:
             to_compile = changes.added + changes.modified
             report.files_skipped = len(changes.unchanged)
             report.files_deleted = len(changes.deleted)
-            for deleted_path in changes.deleted:
-                manifest.files.pop(deleted_path, None)
+
+            stale_paths = changes.deleted + [e.path for e in changes.modified]
+            if stale_paths:
+                await self._purge_stale_artifacts(stale_paths, manifest)
         else:
             to_compile = discovered
             report.files_skipped = 0
@@ -519,8 +521,6 @@ class KnowledgeCompiler:
                     has_table_digest=result.has_table_digest,
                     table_count=result.table_count,
                 )
-                _mentry = manifest.files[result.path]
-                print(f"SEARCH_WIKI_DEBUG [C4] manifest_entry: has_tree={_mentry.has_tree}, has_table_digest={_mentry.has_table_digest}, file_hash={_mentry.file_hash}", flush=True)
 
             # Phase 3 inline: aggregate while the result is still alive
             if not result.error and result.summary:
@@ -659,6 +659,53 @@ class KnowledgeCompiler:
         return changes
 
     # ------------------------------------------------------------------ #
+    #  Stale artifact cleanup                                             #
+    # ------------------------------------------------------------------ #
+
+    async def _purge_stale_artifacts(
+        self,
+        file_paths: List[str],
+        manifest: CompileManifest,
+    ) -> None:
+        """Remove disk artifacts and DuckDB clusters for deleted/modified files.
+
+        Called before recompilation so that modified files start with a
+        clean slate and deleted files leave no residue.
+        """
+        artifact_dirs = {
+            "trees": ".json",
+            "content": ".txt",
+            "table_digests": ".json",
+            "xlsx_digests": ".txt",
+        }
+
+        for file_path in file_paths:
+            entry = manifest.files.get(file_path)
+            if entry is None:
+                continue
+
+            file_hash = entry.file_hash
+
+            # 1. Remove disk artifacts keyed by file_hash
+            if file_hash:
+                for subdir, ext in artifact_dirs.items():
+                    artifact = self._compile_dir / subdir / f"{file_hash}{ext}"
+                    try:
+                        artifact.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+            # 2. Remove associated knowledge clusters from DuckDB
+            for cluster_id in entry.cluster_ids:
+                try:
+                    await self._storage.remove(cluster_id)
+                except Exception:
+                    pass
+
+            # 3. Drop the manifest entry
+            manifest.files.pop(file_path, None)
+
+    # ------------------------------------------------------------------ #
     #  Single-file compilation                                            #
     # ------------------------------------------------------------------ #
 
@@ -678,7 +725,6 @@ class KnowledgeCompiler:
         per-file peak memory bounded.
         """
         result = FileCompileResult(path=entry.path)
-        print(f"SEARCH_WIKI_DEBUG [C1] _compile_single_file: file_path={entry.path}, file_hash={entry.file_hash}", flush=True)
         try:
             await self._log.info(f"[Compile] Processing: {Path(entry.path).name}")
 
