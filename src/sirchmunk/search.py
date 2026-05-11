@@ -2231,6 +2231,14 @@ class AgenticSearch(BaseSearch):
     _CHAR_RANGE_MAX_SPAN_RATIO: float = 0.8
     """char_range spanning more than this ratio of the document is treated as invalid."""
 
+    # --- Hierarchical file selection for large tree pools ---
+    _TREE_PREFILTER_THRESHOLD: int = 15
+    """Tree pool size above which rule-based pre-filtering is applied."""
+    _TREE_PREFILTER_MAX_CANDIDATES: int = 10
+    """Maximum candidate trees forwarded to the LLM after pre-filtering."""
+    _TREE_PREFILTER_MIN_SCORE: float = 0.5
+    """Minimum relevance score for a tree to survive pre-filtering."""
+
     # --- Tree navigation retry (Plan 3) ---
     _NAV_RETRY_MIN_EVIDENCE_CHARS: int = 200
     """Evidence below this length triggers a retry with expanded results."""
@@ -5100,32 +5108,82 @@ class AgenticSearch(BaseSearch):
         except Exception:
             return []
 
+    @staticmethod
+    def _prefilter_trees_by_query(
+        query: str, trees: list, max_candidates: int, min_score: float,
+    ) -> list:
+        """Rule-based pre-filter: score trees by query-token overlap with filenames.
+
+        Extracts meaningful tokens from the query (alphanumeric words, 4-digit
+        years, multi-word entity fragments) and scores each tree's filename by
+        weighted token overlap.  Returns the top-scoring candidates, or the
+        full list if fewer than *max_candidates* pass the threshold.
+
+        This avoids sending hundreds of root summaries to the LLM.
+        """
+        raw_tokens = re.findall(r"[A-Za-z0-9]+", query.lower())
+        tokens = [t for t in raw_tokens if len(t) >= 2 and t not in _STOP_WORDS]
+        if not tokens:
+            return trees
+
+        year_tokens = {t for t in tokens if re.fullmatch(r"(?:19|20)\d{2}", t)}
+        entity_tokens = {t for t in tokens if len(t) >= 3 and t not in year_tokens}
+
+        scored: List[Tuple[float, int]] = []
+        for idx, tree in enumerate(trees):
+            name_lower = Path(tree.file_path).stem.lower()
+            name_parts = set(re.findall(r"[a-z0-9]+", name_lower))
+
+            score = 0.0
+            for tok in entity_tokens:
+                if tok in name_lower:
+                    score += 2.0
+                elif any(tok[:4] in part for part in name_parts if len(tok) >= 4):
+                    score += 0.5
+            for yr in year_tokens:
+                if yr in name_lower:
+                    score += 3.0
+
+            scored.append((score, idx))
+
+        scored.sort(key=lambda x: -x[0])
+
+        candidates = [trees[idx] for sc, idx in scored if sc >= min_score]
+        if not candidates:
+            return [trees[idx] for _, idx in scored[:max_candidates]]
+        return candidates[:max_candidates]
+
     async def _llm_select_from_trees(
         self, query: str, trees: list, max_select: int,
     ) -> List[str]:
-        """LLM-driven file selection from tree root summaries.
+        """Two-stage LLM-driven file selection from tree root summaries.
 
-        Presents root summaries to the LLM and returns the selected file
-        paths.  When the number of trees is at most *max_select*, returns
-        all paths without an LLM call.
+        Stage 1 (rule-based): when the pool exceeds ``_TREE_PREFILTER_THRESHOLD``,
+        narrow candidates by query-token / filename overlap.
+        Stage 2 (LLM): present root summaries of the narrowed set for precise selection.
 
-        Args:
-            query: User query string.
-            trees: List of ``DocumentTree`` objects (pre-loaded).
-            max_select: Maximum number of files to select.
-
-        Returns:
-            Selected file paths, or empty list.
+        When the number of trees is at most *max_select*, returns all paths
+        without an LLM call.
         """
         if not trees:
             return []
         if len(trees) <= max_select:
             return [t.file_path for t in trees]
 
+        pool = trees
+        if len(pool) > self._TREE_PREFILTER_THRESHOLD:
+            pool = self._prefilter_trees_by_query(
+                query, pool,
+                max_candidates=self._TREE_PREFILTER_MAX_CANDIDATES,
+                min_score=self._TREE_PREFILTER_MIN_SCORE,
+            )
+            if len(pool) <= max_select:
+                return [t.file_path for t in pool]
+
         listing = "\n".join(
             f"[{i}] {Path(t.file_path).name}: "
             f"{(t.root.summary or '')[:self._CATALOG_SUMMARY_TRUNCATE]}"
-            for i, t in enumerate(trees)
+            for i, t in enumerate(pool)
         )
         prompt = (
             f'Given the query: "{query}"\n\n'
@@ -5143,18 +5201,18 @@ class AgenticSearch(BaseSearch):
             if m:
                 selected_indices = [
                     idx for idx in json.loads(m.group())
-                    if isinstance(idx, int) and 0 <= idx < len(trees)
+                    if isinstance(idx, int) and 0 <= idx < len(pool)
                 ]
         except (json.JSONDecodeError, TypeError):
             pass
 
         if not selected_indices:
-            selected_indices = list(range(min(max_select, len(trees))))
+            selected_indices = list(range(min(max_select, len(pool))))
 
         return [
-            trees[idx].file_path
+            pool[idx].file_path
             for idx in selected_indices[:max_select]
-            if Path(trees[idx].file_path).exists()
+            if Path(pool[idx].file_path).exists()
         ]
 
     async def _probe_tree_index(self, query: str) -> List[str]:

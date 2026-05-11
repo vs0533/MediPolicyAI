@@ -67,6 +67,10 @@ _TABLE_NUMERIC_DENSITY_THRESHOLD = 0.15
 # Selective force-OCR: max pages to re-extract with forced OCR per document
 _FORCE_OCR_MAX_PAGES = 30
 
+# Incremental manifest flush: persist manifest every N completed files
+# to survive interrupted compiles without excessive I/O overhead.
+_MANIFEST_FLUSH_INTERVAL = 10
+
 # Shared numeric-token regex for table detection heuristics.
 # Matches: $1,234  (1,234)  12.5%  3.14e-5  1,000
 _NUM_TOKEN_RE = re.compile(
@@ -440,6 +444,7 @@ class KnowledgeCompiler:
         # Phase 2: compile files with bounded concurrency
         semaphore = asyncio.Semaphore(concurrency)
         results: List[FileCompileResult] = []
+        _files_since_flush = 0
 
         async def _bounded(entry: FileEntry) -> FileCompileResult:
             async with semaphore:
@@ -454,7 +459,6 @@ class KnowledgeCompiler:
             else:
                 if result.tree:
                     report.trees_built += 1
-                # Update manifest
                 manifest.files[result.path] = FileManifestEntry(
                     file_hash=get_fast_hash(result.path) or "",
                     compiled_at=datetime.now(timezone.utc).isoformat(),
@@ -471,6 +475,17 @@ class KnowledgeCompiler:
                 _mentry = manifest.files[result.path]
                 print(f"SEARCH_WIKI_DEBUG [C4] manifest_entry: has_tree={_mentry.has_tree}, has_table_digest={_mentry.has_table_digest}, file_hash={_mentry.file_hash}", flush=True)
 
+            # Incremental manifest flush to survive interrupted compiles
+            _files_since_flush += 1
+            if _files_since_flush >= _MANIFEST_FLUSH_INTERVAL:
+                manifest.last_compile_at = datetime.now(timezone.utc).isoformat()
+                self._save_manifest(manifest)
+                _files_since_flush = 0
+
+        # Phase 2 checkpoint: persist manifest before knowledge aggregation
+        manifest.last_compile_at = datetime.now(timezone.utc).isoformat()
+        self._save_manifest(manifest)
+
         # Phase 3: aggregate results into knowledge network
         await self._log.info("[Compile] Phase 3: Knowledge aggregation")
         for r in results:
@@ -484,15 +499,15 @@ class KnowledgeCompiler:
         await self._log.info("[Compile] Phase 4: Building cross-references")
         report.cross_refs_built = await self._build_cross_references(results)
 
-        # Phase 5: persist manifest + document catalog
+        # Phase 5: persist final manifest + derived indices
+        # Catalog and summary index are rebuilt from the manifest, so even
+        # partial compiles produce usable search-time metadata.
         manifest.last_compile_at = datetime.now(timezone.utc).isoformat()
         self._save_manifest(manifest)
         self._storage.force_sync()
 
-        # Generate document catalog for search-time routing
         self._build_document_catalog(manifest)
 
-        # Phase: Build summary index for embedding+BM25 fallback (optional, non-blocking)
         await self._build_summary_index(manifest)
 
         report.elapsed_seconds = time.monotonic() - t0
@@ -2553,7 +2568,13 @@ class KnowledgeCompiler:
         return CompileManifest()
 
     def _save_manifest(self, manifest: CompileManifest) -> None:
-        self._manifest_path.write_text(manifest.to_json(), encoding="utf-8")
+        """Atomically persist the manifest via write-to-tmp + rename.
+
+        This prevents partial JSON on disk if the process is killed mid-write.
+        """
+        tmp_path = self._manifest_path.with_suffix(".json.tmp")
+        tmp_path.write_text(manifest.to_json(), encoding="utf-8")
+        tmp_path.replace(self._manifest_path)
 
     # ------------------------------------------------------------------ #
     #  Document catalog for search-time routing                           #
