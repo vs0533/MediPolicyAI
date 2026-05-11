@@ -9,9 +9,12 @@ knowledge clusters for downstream search acceleration.
 
 import asyncio
 import bisect
+import ctypes
+import gc
 import json
 import math
 import os
+import platform
 import random
 import re
 import hashlib
@@ -74,6 +77,20 @@ _MANIFEST_FLUSH_INTERVAL = 10
 # Page-level extraction: max pages to load into memory per batch.
 # Prevents loading all 200-400 pages of a large PDF at once.
 _PAGE_SCAN_BATCH_SIZE = 50
+
+# How often to run gc.collect() inside the compile loop (every N files).
+_GC_INTERVAL = 5
+
+
+def _force_gc() -> None:
+    """Aggressively reclaim Python-managed memory and nudge the C allocator."""
+    gc.collect()
+    if platform.system() == "Linux":
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except (OSError, AttributeError):
+            pass
+
 
 # Shared numeric-token regex for table detection heuristics.
 # Matches: $1,234  (1,234)  12.5%  3.14e-5  1,000
@@ -475,6 +492,7 @@ class KnowledgeCompiler:
         semaphore = asyncio.Semaphore(concurrency)
         _xref_pairs: List[Tuple[str, List[str]]] = []  # lightweight (path, cluster_ids) for Phase 4
         _files_since_flush = 0
+        _files_since_gc = 0
 
         async def _bounded(entry: FileEntry) -> FileCompileResult:
             async with semaphore:
@@ -520,6 +538,11 @@ class KnowledgeCompiler:
                 manifest.last_compile_at = datetime.now(timezone.utc).isoformat()
                 self._save_manifest(manifest)
                 _files_since_flush = 0
+
+            _files_since_gc += 1
+            if _files_since_gc >= _GC_INTERVAL:
+                _force_gc()
+                _files_since_gc = 0
 
         # Phase 2 checkpoint: persist manifest before cross-references
         manifest.last_compile_at = datetime.now(timezone.utc).isoformat()
@@ -659,7 +682,7 @@ class KnowledgeCompiler:
         try:
             await self._log.info(f"[Compile] Processing: {Path(entry.path).name}")
 
-            extraction = await DocumentExtractor.extract(
+            extraction = await DocumentExtractor.extract_isolated(
                 entry.path, DocumentExtractor.ENHANCED,
             )
             content = extraction.content
@@ -1218,10 +1241,11 @@ class KnowledgeCompiler:
 
     def _encode_text(self, text: str) -> Optional[Any]:
         """Encode text to embedding vector, returns None on failure."""
-        if not self._embedding:
+        if not self._embedding or not self._embedding.is_ready():
             return None
         try:
-            return self._embedding.encode(text)
+            vectors = self._embedding._encode_sync([text])
+            return vectors[0] if len(vectors) > 0 else None
         except Exception:
             return None
 
@@ -2497,44 +2521,40 @@ class KnowledgeCompiler:
         file_path: str,
         gap_pages: List[int],
     ) -> list[dict[str, Any]]:
-        """Re-extract specific pages with forced OCR + layout detection.
+        """Extract text from gap pages using pypdf (no kreuzberg re-call).
 
-        For pages where the native text layer was not recognized as tables
-        by kreuzberg's RT-DETR model, re-rendering as images may yield
-        better layout detection results.  Uses ``force_ocr_pages`` so only
-        the targeted pages are OCR'd (no full-document penalty).
+        Earlier versions spawned a second kreuzberg extraction with
+        ``force_ocr_pages``, which doubled native memory pressure.
+        Using pypdf instead avoids Rust/native allocations entirely
+        while still capturing page text for the table digest.
 
         Args:
             file_path:  Path to the PDF.
-            gap_pages:  0-indexed page numbers to force OCR on.  Capped at
-                        :data:`_FORCE_OCR_MAX_PAGES` to bound compile time.
+            gap_pages:  0-indexed page numbers.
 
         Returns:
-            List of kreuzberg-format table dicts (with ``markdown``,
-            ``cells``, ``page_number``).
+            List of table-compatible dicts (``markdown``, ``page_number``).
         """
-        from sirchmunk.utils.document_extractor import ExtractionProfile
-
         if not gap_pages:
             return []
 
         capped = sorted(gap_pages)[:_FORCE_OCR_MAX_PAGES]
-
-        profile = ExtractionProfile(
-            output_format="markdown",
-            extract_tables=True,
-            force_ocr_pages=tuple(capped),
-        )
+        one_indexed = [p + 1 for p in capped]
         try:
-            extraction = await DocumentExtractor.extract(file_path, profile)
-        except Exception as exc:
-            await self._log.warning(
-                f"[Compile] Selective force-OCR failed for "
-                f"{Path(file_path).name}: {exc}"
-            )
+            pages = DocumentExtractor.extract_pages(file_path, one_indexed)
+        except Exception:
             return []
 
-        return extraction.tables
+        tables: list[dict[str, Any]] = []
+        for pc in pages:
+            text = (pc.content or "").strip()
+            if text and self._page_has_table_density(text):
+                tables.append({
+                    "markdown": text,
+                    "cells": [],
+                    "page_number": pc.page_number,
+                })
+        return tables
 
     # ------------------------------------------------------------------ #
     #  Summary index for embedding + BM25 fallback                        #

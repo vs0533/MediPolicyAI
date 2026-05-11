@@ -11,11 +11,49 @@ All other modules should import from here rather than from kreuzberg directly.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import dataclasses
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, List, Optional, Sequence, Union
 
 from loguru import logger
+
+
+# ---------------------------------------------------------------------------
+# Top-level helper for subprocess-based extraction (must be picklable)
+# ---------------------------------------------------------------------------
+
+def _extract_in_worker(
+    file_path: str,
+    profile_dict: dict[str, Any],
+) -> dict[str, Any]:
+    """Run kreuzberg extraction inside a worker process.
+
+    Returns a plain dict so the result crosses the process boundary
+    without dragging native kreuzberg objects (and their Rust allocations)
+    back into the parent process.
+    """
+    import asyncio as _aio
+
+    async def _run() -> dict[str, Any]:
+        from sirchmunk.utils.document_extractor import (
+            DocumentExtractor,
+            ExtractionProfile,
+        )
+        profile = ExtractionProfile(**profile_dict)
+        output = await DocumentExtractor.extract(file_path, profile)
+        return {
+            "content": output.content,
+            "mime_type": output.mime_type,
+            "metadata": output.metadata,
+            "tables": output.tables,
+            "detected_languages": output.detected_languages,
+            "page_count": output.page_count,
+        }
+
+    return _aio.run(_run())
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +268,64 @@ class DocumentExtractor:
                 exc,
             )
             raise
+
+    # Shared process pool — lazily created, workers exit after every task
+    # so the OS reclaims all native memory (Rust arenas, layout-model caches).
+    _process_pool: ClassVar[Optional[concurrent.futures.ProcessPoolExecutor]] = None
+    _POOL_WORKERS: ClassVar[int] = max(1, min(os.cpu_count() or 4, 3))
+
+    @classmethod
+    def _get_process_pool(cls) -> concurrent.futures.ProcessPoolExecutor:
+        if cls._process_pool is None:
+            cls._process_pool = concurrent.futures.ProcessPoolExecutor(
+                max_workers=cls._POOL_WORKERS,
+                max_tasks_per_child=1,
+            )
+        return cls._process_pool
+
+    @staticmethod
+    async def extract_isolated(
+        file_path: Union[str, Path],
+        profile: Optional[ExtractionProfile] = None,
+    ) -> ExtractionOutput:
+        """Extract content in an isolated subprocess.
+
+        Identical to :meth:`extract` but runs kreuzberg inside a child
+        process.  ``max_tasks_per_child=1`` ensures each worker exits
+        after one extraction, allowing the OS to reclaim all native
+        memory (Rust arenas, layout-model buffers, image caches).
+
+        Falls back to in-process extraction on subprocess failure.
+        """
+        profile = profile or DocumentExtractor.BASIC
+        profile_dict = {
+            f.name: getattr(profile, f.name)
+            for f in dataclasses.fields(profile)
+        }
+
+        loop = asyncio.get_event_loop()
+        pool = DocumentExtractor._get_process_pool()
+        try:
+            raw = await loop.run_in_executor(
+                pool,
+                _extract_in_worker,
+                str(file_path),
+                profile_dict,
+            )
+            return ExtractionOutput(
+                content=raw["content"],
+                mime_type=raw.get("mime_type", ""),
+                metadata=raw.get("metadata", {}),
+                tables=raw.get("tables", []),
+                detected_languages=raw.get("detected_languages", {}),
+                page_count=raw.get("page_count"),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Subprocess extraction failed for {}, falling back to in-process: {}",
+                file_path, exc,
+            )
+            return await DocumentExtractor.extract(file_path, profile)
 
     @staticmethod
     async def extract_bytes(
