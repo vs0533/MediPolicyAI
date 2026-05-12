@@ -424,6 +424,8 @@ Analyze the provided {text_content} and generate a concise summary in the form o
 3. **Style**: Keep it professional, objective, and clear. Avoid fluff.
 4. **Precision**: When the query asks for a specific value, ratio, number, percentage, or yes/no determination, you MUST compute it and state the precise result. Show key calculation steps when applicable.
 5. **Verify before answering**: For numerical calculations, complete ALL computation steps in the SUMMARY section FIRST. Only write the PRECISE_ANSWER tag AFTER you have verified the final result. If you discover an error during computation, use the corrected value in PRECISE_ANSWER.
+6. **Rounding**: Match the precision implied by the query. If the question specifies units (e.g. "in USD millions", "in billions", "as a percentage") or expects a rounded figure, round your final result accordingly rather than reporting raw calculated values with excessive decimal places.
+7. **Best-effort answering**: Always attempt to answer based on available evidence. When evidence is partial or indirect, derive the best possible answer and note any assumptions. Only mark SHOULD_ANSWER as "false" when the evidence is entirely unrelated to the query.
 
 ### Input Data
 - **User Input**: {user_input}
@@ -465,6 +467,8 @@ Leverage the document context below for better understanding of the source mater
 3. **Style**: Keep it professional, objective, and clear. Avoid fluff.
 4. **Precision**: When the query asks for a specific value, ratio, number, percentage, or yes/no determination, you MUST compute it and state the precise result. Show key calculation steps when applicable.
 5. **Verify before answering**: For numerical calculations, complete ALL computation steps in the SUMMARY section FIRST. Only write the PRECISE_ANSWER tag AFTER you have verified the final result. If you discover an error during computation, use the corrected value in PRECISE_ANSWER.
+6. **Rounding**: Match the precision implied by the query. If the question specifies units (e.g. "in USD millions", "in billions", "as a percentage") or expects a rounded figure, round your final result accordingly rather than reporting raw calculated values with excessive decimal places.
+7. **Best-effort answering**: Always attempt to answer based on available evidence. When evidence is partial or indirect, derive the best possible answer and note any assumptions. Only mark SHOULD_ANSWER as "false" when the evidence is entirely unrelated to the query.
 
 ### Document Context
 {document_context}

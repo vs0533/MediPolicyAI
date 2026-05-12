@@ -2311,6 +2311,12 @@ class AgenticSearch(BaseSearch):
     _NAV_COMPLEMENT_MIN_COMPONENTS: int = 2
     """Minimum query decomposition components to trigger complementary navigation."""
 
+    _NAV_PAGE_MARGIN: int = 1
+    """Extra pages to extract on each side of a leaf's page_range."""
+
+    _NAV_REF_PAGE_MAX: int = 5
+    """Maximum referenced-but-uncovered pages to extract as gap-fill."""
+
     # --- Table evidence budgets ---
     _TABLE_EVIDENCE_DEFAULT_CHARS: int = 20_000
     """Default max_chars for _format_table_evidence."""
@@ -2911,10 +2917,8 @@ class AgenticSearch(BaseSearch):
                     print(f"SEARCH_WIKI_DEBUG [D15] ev_source={_ev_source}, ev_len={len(ev) if ev else 0}", flush=True)
                 return "\n\n---\n\n".join(parts)
 
-            # Launch tree navigation for the primary file alongside rga
-            rga_task = _rga_evidence()
-
-            rga_ev, tree_ev = await asyncio.gather(rga_task, tree_task)
+            # Launch tree navigation alongside rga evidence collection.
+            rga_ev, tree_ev = await asyncio.gather(_rga_evidence(), tree_task)
 
             # Merge: tree evidence first (highest quality), then rga
             if tree_ev and rga_ev:
@@ -4327,6 +4331,29 @@ class AgenticSearch(BaseSearch):
         return covered, missing
 
     @staticmethod
+    def _extract_referenced_pages(text: str) -> Set[int]:
+        """Extract page numbers referenced in evidence text.
+
+        Detects cross-references like 'page 60', 'pages 45-47', 'pp. 12-15'
+        that hint at data-bearing pages not yet included in evidence.
+        """
+        pages: Set[int] = set()
+        for m in re.finditer(
+            r"\b(?:pages?|pp?\.)\s*(\d+)\s*[-\u2013]\s*(\d+)",
+            text, re.IGNORECASE,
+        ):
+            start, end = int(m.group(1)), int(m.group(2))
+            if 0 < start <= end and end - start <= 10:
+                pages.update(range(start, end + 1))
+        for m in re.finditer(
+            r"\b(?:pages?|pp?\.)\s*(\d+)\b", text, re.IGNORECASE,
+        ):
+            p = int(m.group(1))
+            if 0 < p <= 500:
+                pages.add(p)
+        return pages
+
+    @staticmethod
     def _load_compile_content(
         work_path: Path, file_path: str,
     ) -> Optional[str]:
@@ -4602,7 +4629,10 @@ class AgenticSearch(BaseSearch):
         if page_leaves:
             all_pages: set = set()
             for _leaf, (sp, ep) in page_leaves:
-                all_pages.update(range(sp, ep + 1))
+                all_pages.update(range(
+                    max(1, sp - self._NAV_PAGE_MARGIN),
+                    ep + self._NAV_PAGE_MARGIN + 1,
+                ))
             try:
                 page_contents = DocumentExtractor.extract_pages(
                     file_path, sorted(all_pages),
@@ -4697,7 +4727,10 @@ class AgenticSearch(BaseSearch):
             if page_fallback_leaves:
                 all_fb_pages: set = set()
                 for _lf, (sp, ep) in page_fallback_leaves:
-                    all_fb_pages.update(range(sp, ep + 1))
+                    all_fb_pages.update(range(
+                        max(1, sp - self._NAV_PAGE_MARGIN),
+                        ep + self._NAV_PAGE_MARGIN + 1,
+                    ))
                 try:
                     fb_contents = DocumentExtractor.extract_pages(
                         file_path, sorted(all_fb_pages),
@@ -4885,6 +4918,43 @@ class AgenticSearch(BaseSearch):
                 print(f"SEARCH_WIKI_DEBUG [N5.1] standalone_table_fallback: len={len(standalone_table_ev)}", flush=True)
 
         print(f"SEARCH_WIKI_DEBUG [N5] table_supplement: tables_loaded={len(_all_tables) if _all_tables else 0}", flush=True)
+
+        # ── Phase 6: Referenced-page gap-fill ──
+        # Scan evidence for page cross-references (e.g. TOC entries
+        # pointing to financial statements) and extract any that were
+        # not covered by the navigated leaves.
+        if parts:
+            _covered_pages: Set[int] = set()
+            for leaf in leaves:
+                pr = getattr(leaf, "page_range", None)
+                if pr and len(pr) == 2 and pr[0] is not None:
+                    _covered_pages.update(range(
+                        max(1, pr[0] - self._NAV_PAGE_MARGIN),
+                        pr[1] + self._NAV_PAGE_MARGIN + 1,
+                    ))
+            _referenced = self._extract_referenced_pages("\n\n".join(parts))
+            _gap_pages = sorted(_referenced - _covered_pages)[
+                : self._NAV_REF_PAGE_MAX
+            ]
+            if _gap_pages:
+                try:
+                    _gap_contents = DocumentExtractor.extract_pages(
+                        file_path, _gap_pages,
+                    )
+                    for pc in _gap_contents:
+                        if pc.content and pc.content.strip():
+                            parts.append(
+                                f"[{fname} \u2192 referenced p.{pc.page_number}]"
+                                f"\n{pc.content}"
+                            )
+                    evidence = "\n\n".join(parts)
+                    print(
+                        f"SEARCH_WIKI_DEBUG [N5.2] ref_page_gap_fill: "
+                        f"pages={_gap_pages}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
 
         # --- RGA keyword supplement: fuse keyword hits into tree evidence ---
         if match_objects:
