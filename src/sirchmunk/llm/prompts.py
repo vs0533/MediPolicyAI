@@ -99,8 +99,8 @@ def generate_keyword_extraction_prompt(num_levels: int = 3) -> str:
         # Define granularity characteristics
         if i == 1:
             granularity = "Coarse-grained"
-            desc_text = "Multi-word phrases, compound expressions, broader concepts"
-            examples = '"machine learning algorithms", "data processing pipeline", "neural network training"'
+            desc_text = "Multi-word phrases (2-3 words) that are likely to appear **verbatim** in the target document. Prioritize standard domain terminology (e.g. financial statement headings, technical section titles)"
+            examples = '"capital expenditure", "net income", "accounts payable", "operating cash flow", "total revenue"'
         elif i == num_levels:
             granularity = "Fine-grained"
             desc_text = "Single words, precise terms, atomic concepts"
@@ -517,9 +517,15 @@ DEEP_SECTION_SELECT = """Given the user query and a document section map, select
 
 ### Instructions
 1. Identify which sections contain data needed to answer the query.
-2. For questions requiring computation (ratios, growth rates, comparisons), select ALL sections containing the required input data.
+2. For questions requiring computation (ratios, growth rates, comparisons), select ALL sections containing the required input data — even if you think some may be redundant.
 3. Prefer sections containing structured data (tables, financial statements) over narrative sections.
-4. Select 1-5 sections. Fewer is better if you are confident.
+4. For financial/annual report queries, ALWAYS include sections matching these types when available:
+   - Income Statement / Consolidated Statements of Operations (revenue, expenses, net income)
+   - Balance Sheet / Consolidated Balance Sheets (assets, liabilities, equity)
+   - Cash Flow Statement / Consolidated Statements of Cash Flows (capex, operating cash flow)
+   - Notes to Financial Statements (breakdowns, segment data, detailed schedules)
+   - Management's Discussion and Analysis (context, trends, explanations)
+5. Select 2-6 sections. When in doubt, select MORE rather than fewer — missing data causes answer failure.
 
 ### Output
 Return ONLY a JSON array of section indices (0-based) from the map above:

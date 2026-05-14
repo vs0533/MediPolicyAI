@@ -1048,8 +1048,24 @@ class AgenticSearch(BaseSearch):
 
         if not summary:
             summary = llm_response.strip()
-            should_answer = False
-            should_save = False
+            # Fallback: detect **Answer: xxx** markdown format used by models
+            # that ignore <SUMMARY>/<SHOULD_ANSWER> tags (e.g. qwen).
+            _answer_match = re.search(
+                r'\*\*Answer:\s*(.+?)\*\*', llm_response, re.DOTALL,
+            )
+            if _answer_match:
+                _answer_val = _answer_match.group(1).strip()
+                if _answer_val and not cls._is_refusal_answer(_answer_val):
+                    should_answer = True
+                    should_save = True
+                    if not precise:
+                        precise = _answer_val
+                else:
+                    should_answer = False
+                    should_save = False
+            else:
+                should_answer = False
+                should_save = False
 
         # P3: Never persist refusal/no-data answers to cluster cache
         if should_save and cls._is_refusal_answer(precise or summary):
@@ -1943,7 +1959,7 @@ class AgenticSearch(BaseSearch):
                 f"[Phase 4] Launching structured reasoning for "
                 f"{len(_sr_files)} tree-indexed files"
             )
-            sr_answer, sr_cluster = await self._deep_structured_reasoning(
+            sr_answer, sr_cluster, sr_evidence = await self._deep_structured_reasoning(
                 query, _sr_files, artifacts, context,
             )
 
@@ -1952,7 +1968,7 @@ class AgenticSearch(BaseSearch):
                     sr_answer
                 )
                 accepted, accept_reason = self._evaluate_evidence_acceptance(
-                    query, sr_answer, should_answer,
+                    query, sr_evidence or sr_answer, should_answer,
                 )
                 await self._logger.info(
                     f"[Phase 4] Structured reasoning: "
@@ -2001,7 +2017,28 @@ class AgenticSearch(BaseSearch):
                             await self._summarise_cluster_fallback(query)
                         )
                     else:
-                        return _NO_RESULTS_MESSAGE, None, context
+                        # DEEP self-correction before giving up
+                        sc_evidence = await self._deep_self_correct(
+                            query, merged_files, query_keywords, context,
+                        )
+                        if sc_evidence:
+                            sc_cluster = self._make_answer_cluster(
+                                query, sc_evidence[:5000], "DSC",
+                                file_paths=list(merged_files)[:3],
+                            )
+                            sc_cluster.content = sc_evidence
+                            answer, should_save, should_answer = (
+                                await self._summarise_cluster(query, sc_cluster)
+                            )
+                            sc_accepted, _ = self._evaluate_evidence_acceptance(
+                                query, sc_evidence, should_answer,
+                            )
+                            if sc_accepted:
+                                cluster = sc_cluster
+                            else:
+                                return _NO_RESULTS_MESSAGE, None, context
+                        else:
+                            return _NO_RESULTS_MESSAGE, None, context
                 if not cluster.search_results:
                     cluster.search_results = list(merged_files)
             elif llm_fallback:
@@ -2062,7 +2099,21 @@ class AgenticSearch(BaseSearch):
                             await self._summarise_cluster_fallback(query)
                         )
                     else:
-                        return _NO_RESULTS_MESSAGE, None, context
+                        sc_evidence = await self._deep_self_correct(
+                            query, merged_files, query_keywords, context,
+                        )
+                        if sc_evidence:
+                            sc_cluster = self._make_answer_cluster(
+                                query, sc_evidence[:5000], "DSC",
+                                file_paths=list(merged_files)[:3],
+                            )
+                            sc_cluster.content = sc_evidence
+                            answer, should_save, _ = (
+                                await self._summarise_cluster(query, sc_cluster)
+                            )
+                            cluster = sc_cluster
+                        else:
+                            return _NO_RESULTS_MESSAGE, None, context
 
         # Sync LLM token accounting into context
         new_usages = self.llm_usages[_llm_usage_start:]
@@ -2470,13 +2521,13 @@ class AgenticSearch(BaseSearch):
     """Expanded tree sample sections for same-file re-sampling (default uses 5)."""
 
     # --- Deep Structured Reasoning ---
-    _DEEP_SECTION_MAP_MAX_DEPTH: int = 2
+    _DEEP_SECTION_MAP_MAX_DEPTH: int = 3
     """Maximum tree depth for section map construction (top-N layers)."""
     _DEEP_MAX_EXTRACT_PAGES: int = 12
     """Maximum pages to extract per file in targeted page extraction."""
     _DEEP_STRUCTURED_MAX_CHARS: int = 30_000
     """Maximum character budget for structured evidence per file."""
-    _DEEP_MAX_RECOVERY_ROUNDS: int = 2
+    _DEEP_MAX_RECOVERY_ROUNDS: int = 3
     """Maximum rounds of missing-data recovery before final answer."""
     _DEEP_STRUCTURED_MAX_FILES: int = 3
     """Maximum files to process through structured reasoning pipeline."""
@@ -5345,6 +5396,11 @@ class AgenticSearch(BaseSearch):
         Also extracts cross-lingual alternative keywords from the
         ``<KEYWORDS_ALT>`` block and merges them into the result list.
 
+        Additionally synthesises rga-friendly compound phrases from
+        Level 1 keywords so that downstream ``_retrieve_by_keywords``
+        tries exact multi-word matches before falling back to atomic
+        terms (mirrors the strategy used by FAST mode).
+
         Returns:
             Tuple of (keyword_idf_dict, keyword_list).
         """
@@ -5368,9 +5424,26 @@ class AgenticSearch(BaseSearch):
         for kw_set in keyword_sets:
             if kw_set:
                 merged = {**kw_set, **alt_keywords}
-                kw_list = list(merged.keys())
-                await self._logger.info(f"[Probe:Keywords] Extracted: {kw_list}")
-                return merged, kw_list
+                # Synthesise rga-friendly compound phrases: promote
+                # multi-word Level-1 keywords to the front with boosted
+                # IDF so _retrieve_by_keywords tries them first as exact
+                # phrases (similar to FAST's primary/fallback strategy).
+                compound_phrases: Dict[str, float] = {}
+                atomic_terms: Dict[str, float] = {}
+                for kw, idf in merged.items():
+                    if " " in kw.strip() and len(kw.split()) >= 2:
+                        compound_phrases[kw] = max(idf, 7.0)
+                    else:
+                        atomic_terms[kw] = idf
+                # Compounds first, then atomics — preserves ordering for
+                # _retrieve_by_keywords which iterates keywords in order.
+                ordered = {**compound_phrases, **atomic_terms}
+                kw_list = list(ordered.keys())
+                await self._logger.info(
+                    f"[Probe:Keywords] Extracted: {kw_list} "
+                    f"(compounds={len(compound_phrases)})"
+                )
+                return ordered, kw_list
 
         if alt_keywords:
             return alt_keywords, list(alt_keywords.keys())
@@ -6507,7 +6580,7 @@ class AgenticSearch(BaseSearch):
         tree_files: List[str],
         artifacts: Any,
         context: "SearchContext",
-    ) -> Tuple[str, Optional["KnowledgeCluster"]]:
+    ) -> Tuple[str, Optional["KnowledgeCluster"], str]:
         """Orchestrate the Deep Structured Reasoning pipeline.
 
         Phases:
@@ -6517,12 +6590,14 @@ class AgenticSearch(BaseSearch):
           4. Synthesis — ROI_RESULT_SUMMARY on targeted evidence (1 LLM)
           5. Recovery — if refused, expand sections and re-synthesize
 
-        Returns the raw LLM output (compatible with ``_parse_summary_response``)
-        and a cluster for persistence.
+        Returns ``(raw_llm_output, cluster, combined_evidence)`` where
+        *combined_evidence* is the raw document text fed to the LLM so
+        callers can use it for evidence-acceptance checks instead of
+        the LLM's answer text.
         """
         indexer = self._get_tree_indexer()
         if indexer is None:
-            return "", None
+            return "", None, ""
 
         all_evidence_parts: List[str] = []
 
@@ -6568,7 +6643,7 @@ class AgenticSearch(BaseSearch):
             all_evidence_parts.append(f"[Source: {fname}]\n{raw_evidence}")
 
         if not all_evidence_parts:
-            return "", None
+            return "", None, ""
 
         combined_evidence = "\n\n---\n\n".join(all_evidence_parts)
 
@@ -6626,7 +6701,7 @@ class AgenticSearch(BaseSearch):
                         continue
                     section_map, sections_meta = self._build_section_map(
                         tree.root,
-                        max_depth=self._DEEP_SECTION_MAP_MAX_DEPTH + 1,
+                        max_depth=self._DEEP_SECTION_MAP_MAX_DEPTH + recovery_round,
                     )
                     if not sections_meta:
                         continue
@@ -6680,7 +6755,102 @@ class AgenticSearch(BaseSearch):
             file_paths=tree_files[: self._DEEP_STRUCTURED_MAX_FILES],
         )
 
-        return raw_response, cluster
+        return raw_response, cluster, combined_evidence
+
+    async def _deep_self_correct(
+        self,
+        query: str,
+        merged_files: List[str],
+        query_keywords: Dict[str, float],
+        context: "SearchContext",
+    ) -> Optional[str]:
+        """Gather alternative evidence when DEEP Phase 4 answer is rejected.
+
+        Four strategies tried in order, stopping at first success:
+          A) Expanded tree-guided sampling on the primary file.
+          B) rga keyword window extraction on primary files using
+             Phase-1 keywords (reuses the rga infrastructure).
+          C) Semantically similar cluster from knowledge storage.
+          D) Tree-guided sampling on secondary merged files.
+
+        Returns alternative evidence text, or ``None`` when every
+        strategy fails.
+        """
+        primary_files = merged_files[:2]
+        secondary_files = merged_files[2:5]
+
+        # Strategy A: expanded tree sampling on primary file
+        for fp in primary_files:
+            expanded_ev = await self._tree_guided_sample(
+                fp, query,
+                max_chars=self._FAST_MAX_EVIDENCE_CHARS * 2,
+            )
+            if isinstance(expanded_ev, str) and len(expanded_ev.strip()) > 100:
+                await self._logger.info(
+                    "[DEEP:SelfCorrect] Strategy A succeeded: "
+                    f"expanded tree sample from {Path(fp).name}"
+                )
+                return expanded_ev
+
+        # Strategy B: tree-navigated evidence with expanded parameters
+        for fp in primary_files:
+            try:
+                nav_ev = await self._navigate_tree_for_evidence(
+                    fp, query,
+                    max_results=self._SELF_CORRECT_EXPANDED_NAV_RESULTS,
+                )
+                if nav_ev and len(nav_ev.strip()) > 100:
+                    await self._logger.info(
+                        "[DEEP:SelfCorrect] Strategy B succeeded: "
+                        f"expanded tree navigation on {Path(fp).name}"
+                    )
+                    return nav_ev
+            except Exception:
+                pass
+
+        # Strategy C: semantically similar cluster from knowledge storage
+        if self.embedding_client and self.knowledge_storage:
+            try:
+                qe = self.embedding_client.encode(query)
+                if qe is not None:
+                    vec = qe.tolist() if hasattr(qe, "tolist") else list(qe)
+                    hits = await self.knowledge_storage.search_similar_clusters(
+                        query_embedding=vec, top_k=2, similarity_threshold=0.50,
+                    )
+                    if hits:
+                        parts: List[str] = []
+                        for h in hits[:2]:
+                            c = await self.knowledge_storage.get(h["id"])
+                            if c and c.content:
+                                parts.append(str(c.content)[:3000])
+                                for ev in (c.evidences or [])[:3]:
+                                    for s in (ev.snippets or [])[:2]:
+                                        parts.append(s[:500])
+                        if parts:
+                            await self._logger.info(
+                                "[DEEP:SelfCorrect] Strategy C succeeded: "
+                                "knowledge storage cluster"
+                            )
+                            return "\n\n---\n\n".join(parts)
+            except Exception:
+                pass
+
+        # Strategy D: tree sampling on secondary files
+        for fp in secondary_files:
+            tree_ev = await self._tree_guided_sample(
+                fp, query,
+                max_chars=self._FAST_MAX_EVIDENCE_CHARS,
+            )
+            if isinstance(tree_ev, str) and len(tree_ev.strip()) > 100:
+                context.mark_file_read(fp)
+                await self._logger.info(
+                    "[DEEP:SelfCorrect] Strategy D succeeded: "
+                    f"secondary file {Path(fp).name}"
+                )
+                return tree_ev
+
+        await self._logger.info("[DEEP:SelfCorrect] All strategies exhausted")
+        return None
 
     async def _react_refinement(
         self,

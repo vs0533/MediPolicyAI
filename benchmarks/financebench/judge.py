@@ -440,14 +440,32 @@ Respond ONLY with a JSON object (no markdown, no extra text):
 
     @staticmethod
     def _is_refusal(text: str) -> bool:
-        """Quick check whether *text* looks like a refusal / non-answer."""
+        """Quick check whether *text* looks like a refusal / non-answer.
+
+        When the text contains an explicit ``**Answer: xxx**`` marker,
+        only the answer value is checked for refusal phrases so that
+        reasoning text containing phrases like "insufficient data" (as
+        analytical context) does not trigger a false positive.
+        """
         if not text or not text.strip():
             return True
         lower = text.strip().lower()
         if lower in ("unknown", "n/a", "none", ""):
             return True
+
+        # If there is an explicit **Answer: xxx** marker, only check that value
+        answer_match = re.search(r'\*\*answer:\s*(.+?)\*\*', lower)
+        if answer_match:
+            answer_val = answer_match.group(1).strip()
+            for phrase in _REFUSAL_INDICATORS:
+                if phrase in answer_val:
+                    return True
+            return False
+
+        # No structured answer marker — check the leading portion only
+        check_region = lower[:300]
         for phrase in _REFUSAL_INDICATORS:
-            if phrase in lower:
+            if phrase in check_region:
                 return True
         return False
 
