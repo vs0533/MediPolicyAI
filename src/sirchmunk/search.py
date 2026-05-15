@@ -23,6 +23,9 @@ from sirchmunk.llm.prompts import (
     FAST_QUERY_ANALYSIS,
     FAST_QUERY_ANALYSIS_WITH_CATALOG,
     ROI_RESULT_SUMMARY,
+    ROI_LOOKUP_SYNTHESIS,
+    ROI_COMPUTATION_SYNTHESIS,
+    ROI_COMPARISON_SYNTHESIS,
     DOC_SUMMARY,
     DOC_CHUNK_SUMMARY,
     DOC_MERGE_SUMMARIES,
@@ -1159,6 +1162,53 @@ class AgenticSearch(BaseSearch):
             return "moderate"
         return "simple"
 
+    _VALID_COMPLEXITIES = frozenset({"simple", "moderate", "complex"})
+    _VALID_INTENTS = frozenset({"lookup", "computation", "comparison"})
+
+    async def _classify_query_intent(
+        self, query: str,
+    ) -> Tuple[str, str]:
+        """Classify query complexity and intent via LLM.
+
+        Falls back to regex-based ``_classify_query_complexity`` when the
+        LLM call fails or returns unparseable output.
+
+        Returns:
+            ``(complexity, intent)`` where complexity is
+            ``simple|moderate|complex`` and intent is
+            ``lookup|computation|comparison``.
+        """
+        try:
+            from sirchmunk.llm.prompts import DEEP_QUERY_CLASSIFY
+
+            resp = await self.llm.achat(
+                messages=[{
+                    "role": "user",
+                    "content": DEEP_QUERY_CLASSIFY.format(query=query),
+                }],
+                stream=True,
+            )
+            self.llm_usages.append(resp.usage)
+
+            raw = (resp.content or "").strip()
+            match = re.search(r'\{[^}]+\}', raw)
+            if match:
+                data = json.loads(match.group())
+                complexity = data.get("complexity", "").lower()
+                intent = data.get("intent", "").lower()
+                if (complexity in self._VALID_COMPLEXITIES
+                        and intent in self._VALID_INTENTS):
+                    return complexity, intent
+        except Exception as exc:
+            await self._logger.warning(
+                f"[QueryClassify] LLM classification failed: {exc}, "
+                f"falling back to regex"
+            )
+
+        complexity = self._classify_query_complexity(query)
+        intent = "computation" if complexity != "simple" else "lookup"
+        return complexity, intent
+
     @staticmethod
     def _evaluate_evidence_acceptance(
         query: str,
@@ -1208,6 +1258,256 @@ class AgenticSearch(BaseSearch):
             f"rejected(llm=false, len={evidence_len}, "
             f"kw_coverage={kw_coverage:.2f}, numeric=false)"
         )
+
+    # ------------------------------------------------------------------
+    # Plan E: Computation verification
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Plan D: Evidence adequacy closed-loop
+    # ------------------------------------------------------------------
+
+    async def _check_evidence_completeness(
+        self,
+        query: str,
+        intent: str,
+        evidence: str,
+    ) -> Tuple[bool, List[str]]:
+        """Check if evidence contains all data points needed for the query.
+
+        Returns:
+            ``(is_complete, missing)`` where *missing* lists descriptions
+            of data points not found in the evidence.
+        """
+        try:
+            from sirchmunk.llm.prompts import EVIDENCE_COMPLETENESS_CHECK
+
+            prompt = EVIDENCE_COMPLETENESS_CHECK.format(
+                query=query,
+                intent=intent,
+                evidence_excerpt=evidence[:3000],
+            )
+            resp = await self.llm.achat(
+                messages=[{"role": "user", "content": prompt}],
+                stream=True,
+            )
+            self.llm_usages.append(resp.usage)
+
+            raw = (resp.content or "").strip()
+            match = re.search(r'\{[^}]+\}', raw, re.DOTALL)
+            if match:
+                data = json.loads(match.group())
+                is_complete = bool(data.get("complete", True))
+                missing = data.get("missing", [])
+                if isinstance(missing, list) and missing:
+                    return False, [str(m) for m in missing[:5]]
+                return is_complete, []
+        except Exception as exc:
+            await self._logger.warning(
+                f"[Phase 3.75] Completeness check failed: {exc}"
+            )
+        return True, []
+
+    async def _fill_evidence_gaps(
+        self,
+        query: str,
+        missing: List[str],
+        file_paths: List[str],
+        artifacts: Any,
+    ) -> Optional[str]:
+        """Targeted evidence retrieval for identified gaps.
+
+        Constructs focused sub-queries from *missing* descriptions and
+        re-navigates tree indices or falls back to keyword retrieval.
+
+        Returns supplementary evidence text, or None.
+        """
+        sub_query = f"{query} — specifically: {'; '.join(missing)}"
+        parts: List[str] = []
+
+        indexer = self._get_tree_indexer()
+        for fp in file_paths[:3]:
+            try:
+                if indexer and indexer.has_tree(fp):
+                    ev = await self._navigate_tree_for_evidence(fp, sub_query)
+                    if ev and len(ev.strip()) > 100:
+                        parts.append(
+                            f"[Gap-fill: {Path(fp).name}]\n{ev}"
+                        )
+                        continue
+                ev = await self._tree_guided_sample(fp, sub_query)
+                if isinstance(ev, str) and len(ev.strip()) > 100:
+                    parts.append(f"[Gap-fill: {Path(fp).name}]\n{ev}")
+            except Exception:
+                continue
+
+        if not parts and artifacts and artifacts.tree_available_paths:
+            extra_fps = [
+                fp for fp in artifacts.tree_available_paths
+                if fp not in file_paths
+            ][:2]
+            for fp in extra_fps:
+                try:
+                    ev = await self._navigate_tree_for_evidence(fp, sub_query)
+                    if ev and len(ev.strip()) > 100:
+                        parts.append(
+                            f"[Gap-fill extra: {Path(fp).name}]\n{ev}"
+                        )
+                except Exception:
+                    continue
+
+        if not parts:
+            return None
+        return "\n\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Plan E: Computation verification
+    # ------------------------------------------------------------------
+
+    _ARITH_PATTERNS = [
+        re.compile(
+            r'[\$€£]?\s*'
+            r'([\d,]+(?:\.\d+)?)\s*'
+            r'([+\-\*/])\s*'
+            r'[\$€£]?\s*'
+            r'([\d,]+(?:\.\d+)?)\s*'
+            r'=\s*'
+            r'[\$€£]?\s*'
+            r'([\-]?[\d,]+(?:\.\d+)?)\s*%?'
+        ),
+        re.compile(
+            r'\(\s*'
+            r'[\$€£]?\s*([\d,]+(?:\.\d+)?)\s*'
+            r'([+\-])\s*'
+            r'[\$€£]?\s*([\d,]+(?:\.\d+)?)\s*'
+            r'\)\s*[/\*]\s*'
+            r'[\$€£]?\s*([\d,]+(?:\.\d+)?)\s*'
+            r'=\s*'
+            r'[\$€£]?\s*([\-]?[\d,]+(?:\.\d+)?)\s*%?'
+        ),
+    ]
+
+    _SAFE_EVAL_NS: Dict[str, Any] = {"__builtins__": {}, "abs": abs, "round": round}
+    _ARITH_TOLERANCE: float = 0.01
+
+    @classmethod
+    def _extract_arithmetic_expressions(cls, text: str) -> List[Dict[str, Any]]:
+        """Extract arithmetic expressions and their stated results from text.
+
+        Returns list of ``{"expr": str, "stated": float, "computed": float}``.
+        Only includes entries where Python evaluation succeeded.
+        """
+        results: List[Dict[str, Any]] = []
+
+        def _parse_num(s: str) -> float:
+            return float(s.replace(",", ""))
+
+        for line in text.split("\n"):
+            for pat in cls._ARITH_PATTERNS:
+                for m in pat.finditer(line):
+                    groups = m.groups()
+                    try:
+                        if len(groups) == 4:
+                            a, op, b, stated = groups
+                            a_val, b_val = _parse_num(a), _parse_num(b)
+                            expr = f"{a_val} {op} {b_val}"
+                            computed = eval(expr, cls._SAFE_EVAL_NS)
+                            results.append({
+                                "expr": expr,
+                                "stated": _parse_num(stated),
+                                "computed": float(computed),
+                                "raw": m.group(),
+                            })
+                        elif len(groups) == 5:
+                            a, op, b, divisor, stated = groups
+                            a_val, b_val = _parse_num(a), _parse_num(b)
+                            d_val = _parse_num(divisor)
+                            inner = f"{a_val} {op} {b_val}"
+                            inner_result = eval(inner, cls._SAFE_EVAL_NS)
+                            op2 = "/" if "/" in line[m.start():m.end()] else "*"
+                            computed = eval(
+                                f"{inner_result} {op2} {d_val}",
+                                cls._SAFE_EVAL_NS,
+                            )
+                            results.append({
+                                "expr": f"({inner}) {op2} {d_val}",
+                                "stated": _parse_num(stated),
+                                "computed": float(computed),
+                                "raw": m.group(),
+                            })
+                    except Exception:
+                        continue
+        return results
+
+    async def _verify_computation(
+        self,
+        query: str,
+        answer: str,
+    ) -> Tuple[str, bool]:
+        """Verify arithmetic in computation-type answers.
+
+        Extracts arithmetic expressions, evaluates them with Python, and
+        re-prompts the LLM if a discrepancy is detected.
+
+        Returns:
+            ``(corrected_answer, was_corrected)``.
+        """
+        expressions = self._extract_arithmetic_expressions(answer)
+        if not expressions:
+            return answer, False
+
+        discrepancies = []
+        for expr_info in expressions:
+            stated = expr_info["stated"]
+            computed = expr_info["computed"]
+            if stated == 0 and computed == 0:
+                continue
+            denom = max(abs(stated), abs(computed), 1e-9)
+            if abs(stated - computed) / denom > self._ARITH_TOLERANCE:
+                discrepancies.append(expr_info)
+
+        if not discrepancies:
+            return answer, False
+
+        worst = max(
+            discrepancies,
+            key=lambda d: abs(d["stated"] - d["computed"]),
+        )
+
+        await self._logger.info(
+            f"[Phase 4.5:Verify] Arithmetic discrepancy: "
+            f"{worst['expr']} = {worst['stated']} (stated) vs "
+            f"{worst['computed']} (computed)"
+        )
+
+        try:
+            from sirchmunk.llm.prompts import COMPUTATION_CORRECTION
+
+            correction_prompt = COMPUTATION_CORRECTION.format(
+                query=query,
+                original_answer=answer[:3000],
+                expression=worst["expr"],
+                llm_result=worst["stated"],
+                correct_result=worst["computed"],
+            )
+            resp = await self.llm.achat(
+                messages=[{"role": "user", "content": correction_prompt}],
+                stream=True,
+            )
+            self.llm_usages.append(resp.usage)
+
+            corrected = resp.content or ""
+            if corrected and len(corrected) > 100:
+                await self._logger.info(
+                    "[Phase 4.5:Verify] Correction applied"
+                )
+                return corrected, True
+        except Exception as exc:
+            await self._logger.warning(
+                f"[Phase 4.5:Verify] Correction failed: {exc}"
+            )
+
+        return answer, False
 
     @staticmethod
     def _extract_and_validate_multi_level_keywords(
@@ -1841,28 +2141,14 @@ class AgenticSearch(BaseSearch):
             f"dir_scan_files={len(dir_scan_files)}"
         )
 
-        # --- Phase 2.5: Parallel tree pre-navigation for top tree hits ---
-        _pre_nav_evidence: Dict[str, str] = {}
+        # --- Phase 2.5: Full tree evidence collection for DEEP mode ---
+        _tree_evidence: Dict[str, str] = {}
+        _tree_sufficient = False
         if tree_hits:
-            _nav_fps = [fp for fp in tree_hits[:self._DEEP_PRE_NAV_MAX_FILES]]
-            if _nav_fps:
-                _nav_results = await asyncio.gather(
-                    *[self._tree_guided_sample(
-                        fp, query, max_chars=self._FAST_MAX_EVIDENCE_CHARS,
-                    ) for fp in _nav_fps],
-                    return_exceptions=True,
-                )
-                for fp, nav_res in zip(_nav_fps, _nav_results):
-                    if isinstance(nav_res, Exception):
-                        await self._logger.warning(
-                            f"[Phase 2.5] Tree pre-nav failed for {Path(fp).name}: {nav_res}"
-                        )
-                    elif isinstance(nav_res, str) and nav_res:
-                        _pre_nav_evidence[fp] = nav_res
-                if _pre_nav_evidence:
-                    await self._logger.info(
-                        f"[Phase 2.5] Pre-navigated {len(_pre_nav_evidence)} tree files"
-                    )
+            _tree_evidence, _tree_sufficient = (
+                await self._collect_deep_tree_evidence(tree_hits, query)
+            )
+        _pre_nav_evidence = _tree_evidence
 
         # ==============================================================
         # Phase 3: Merge file paths + build KnowledgeCluster
@@ -1898,11 +2184,35 @@ class AgenticSearch(BaseSearch):
             await self._logger.info(f"[Phase 3] Merged {len(merged_files)} unique candidate files")
 
         cluster: Optional[KnowledgeCluster] = None
-        if merged_files:
+        if _tree_sufficient and _tree_evidence:
+            combined_tree_ev = "\n\n---\n\n".join(
+                f"[Source: {Path(fp).name}]\n{ev}"
+                for fp, ev in _tree_evidence.items()
+            )
+            cluster = self._make_answer_cluster(
+                query, combined_tree_ev[:5000], "DTE",
+                file_paths=list(_tree_evidence.keys()),
+            )
+            cluster.content = combined_tree_ev
+            await self._logger.info(
+                f"[Phase 3:DirectTree] Tree evidence sufficient "
+                f"({len(combined_tree_ev)} chars), bypassing Monte Carlo"
+            )
+        elif merged_files:
             cluster = await self._build_cluster(
                 query=query, file_paths=merged_files,
                 query_keywords=query_keywords, top_k_files=top_k_files,
             )
+            if _tree_evidence and cluster and cluster.content:
+                pre_nav_parts = [
+                    f"[Tree evidence: {Path(fp).name}]\n{ev}"
+                    for fp, ev in _tree_evidence.items()
+                ]
+                if pre_nav_parts:
+                    pre_nav_ctx = "\n\n".join(pre_nav_parts)
+                    if isinstance(cluster.content, list):
+                        cluster.content = "\n".join(cluster.content)
+                    cluster.content = f"{cluster.content}\n\n{pre_nav_ctx}"
 
         # ==============================================================
         # Phase 3.5: Graph context enrichment (P5)
@@ -1911,17 +2221,6 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         graph_ctx = ""
         if cluster:
-            # Merge pre-navigated tree evidence into cluster content
-            if _pre_nav_evidence and cluster.content:
-                pre_nav_parts = []
-                for fp, ev in _pre_nav_evidence.items():
-                    pre_nav_parts.append(f"[Tree evidence: {Path(fp).name}]\n{ev}")
-                if pre_nav_parts:
-                    pre_nav_ctx = "\n\n".join(pre_nav_parts)
-                    if isinstance(cluster.content, list):
-                        cluster.content = "\n".join(cluster.content)
-                    cluster.content = f"{cluster.content}\n\n{pre_nav_ctx}"
-
             graph_ctx = await self._gather_graph_context(cluster)
             if graph_ctx and cluster.content:
                 if isinstance(cluster.content, list):
@@ -1929,20 +2228,56 @@ class AgenticSearch(BaseSearch):
                 cluster.content = f"{cluster.content}\n\n{graph_ctx}"
 
         # ==============================================================
+        # Phase 3.8: Query classification (feeds Phase 3.75 + Phase 4)
+        # ==============================================================
+        _query_complexity, _query_intent = await self._classify_query_intent(query)
+        context.increment_loop()
+        await self._logger.info(
+            f"[Phase 3.8] Query: complexity={_query_complexity}, intent={_query_intent}"
+        )
+
+        # ==============================================================
+        # Phase 3.75: Evidence adequacy closed-loop (Plan D)
+        # For computation/comparison queries, verify required data points
+        # are present and trigger targeted gap-fill if missing.
+        # ==============================================================
+        if (
+            cluster and cluster.content
+            and _query_intent in ("computation", "comparison")
+        ):
+            _ev_text = (
+                str(cluster.content) if isinstance(cluster.content, str)
+                else "\n".join(cluster.content)
+            )
+            is_complete, missing = await self._check_evidence_completeness(
+                query, _query_intent, _ev_text,
+            )
+            context.increment_loop()
+            if not is_complete and missing:
+                await self._logger.info(
+                    f"[Phase 3.75] Missing data points: {missing}"
+                )
+                gap_evidence = await self._fill_evidence_gaps(
+                    query, missing, merged_files, artifacts,
+                )
+                if gap_evidence:
+                    if isinstance(cluster.content, list):
+                        cluster.content = "\n".join(cluster.content)
+                    cluster.content = (
+                        f"{cluster.content}\n\n"
+                        f"[Gap-fill evidence]\n{gap_evidence}"
+                    )
+                    await self._logger.info(
+                        f"[Phase 3.75] Filled {len(missing)} gaps "
+                        f"({len(gap_evidence)} chars)"
+                    )
+
+        # ==============================================================
         # Phase 4: Structured Reasoning → Cluster Summary fallback
-        # P0: DEEP mode always goes through full reasoning pipeline —
-        # no fast triage short-circuit.  P4: query complexity determines
-        # whether the heavier section-map SR fires or we go straight to
-        # cluster synthesis.
         # ==============================================================
         context.increment_loop()
         answer = ""
         should_save = True
-
-        _query_complexity = self._classify_query_complexity(query)
-        await self._logger.info(
-            f"[Phase 4] Query complexity: {_query_complexity}"
-        )
 
         # Attempt structured reasoning for moderate/complex queries
         _sr_files: List[str] = []
@@ -1960,7 +2295,7 @@ class AgenticSearch(BaseSearch):
                 f"{len(_sr_files)} tree-indexed files"
             )
             sr_answer, sr_cluster, sr_evidence = await self._deep_structured_reasoning(
-                query, _sr_files, artifacts, context,
+                query, _sr_files, artifacts, context, _query_intent,
             )
 
             if sr_answer:
@@ -2001,7 +2336,7 @@ class AgenticSearch(BaseSearch):
                     "[Phase 4:Fallback] Generating summary from cluster"
                 )
                 answer, should_save, should_answer = (
-                    await self._summarise_cluster(query, cluster)
+                    await self._summarise_cluster(query, cluster, _query_intent)
                 )
                 cluster_evidence = (
                     str(cluster.content) if cluster.content else ""
@@ -2028,7 +2363,7 @@ class AgenticSearch(BaseSearch):
                             )
                             sc_cluster.content = sc_evidence
                             answer, should_save, should_answer = (
-                                await self._summarise_cluster(query, sc_cluster)
+                                await self._summarise_cluster(query, sc_cluster, _query_intent)
                             )
                             sc_accepted, _ = self._evaluate_evidence_acceptance(
                                 query, sc_evidence, should_answer,
@@ -2049,8 +2384,6 @@ class AgenticSearch(BaseSearch):
                 await self._logger.info(
                     "[Phase 4:Fallback] Launching ReAct refinement"
                 )
-                # Seed ReAct with all available prior context so it
-                # doesn't start from scratch.
                 react_parts: List[str] = []
                 if spec_context:
                     react_parts.append(spec_context)
@@ -2085,7 +2418,7 @@ class AgenticSearch(BaseSearch):
                 if not cluster:
                     return _NO_RESULTS_MESSAGE, None, context
                 answer, should_save, should_answer = (
-                    await self._summarise_cluster(query, cluster)
+                    await self._summarise_cluster(query, cluster, _query_intent)
                 )
                 final_evidence = (
                     str(cluster.content) if cluster.content else ""
@@ -2109,11 +2442,19 @@ class AgenticSearch(BaseSearch):
                             )
                             sc_cluster.content = sc_evidence
                             answer, should_save, _ = (
-                                await self._summarise_cluster(query, sc_cluster)
+                                await self._summarise_cluster(query, sc_cluster, _query_intent)
                             )
                             cluster = sc_cluster
                         else:
                             return _NO_RESULTS_MESSAGE, None, context
+
+        # ==============================================================
+        # Phase 4.5: Computation verification (Plan E)
+        # ==============================================================
+        if answer and _query_intent == "computation":
+            answer, was_corrected = await self._verify_computation(query, answer)
+            if was_corrected:
+                _, should_save, _ = self._parse_summary_response(answer)
 
         # Sync LLM token accounting into context
         new_usages = self.llm_usages[_llm_usage_start:]
@@ -2537,6 +2878,12 @@ class AgenticSearch(BaseSearch):
     """Minimum evidence character length for heuristic override."""
     _EVIDENCE_KEYWORD_COVERAGE_THRESHOLD: float = 0.5
     """Minimum keyword coverage ratio for heuristic override."""
+
+    # --- Plan A: Evidence channel unification ---
+    _TREE_EVIDENCE_MIN_DIRECT_CHARS: int = 2000
+    """Minimum tree evidence length to bypass Monte Carlo and feed directly to synthesis."""
+    _TREE_DIRECT_KW_THRESHOLD: float = 0.3
+    """Minimum keyword coverage for tree evidence to qualify for the direct channel."""
     _NUMERIC_INTENT_KEYWORDS: frozenset = frozenset({
         "revenue", "margin", "ratio", "ebitda", "income", "profit", "loss",
         "cash", "debt", "equity", "eps", "dpo", "growth", "rate",
@@ -4382,6 +4729,65 @@ class AgenticSearch(BaseSearch):
             f"(pre_nav={'yes' if pre_navigated_leaves else 'no'})"
         )
         return evidence
+
+    async def _collect_deep_tree_evidence(
+        self,
+        file_paths: List[str],
+        query: str,
+    ) -> Tuple[Dict[str, str], bool]:
+        """Full tree navigation for DEEP mode primary files.
+
+        Runs ``_navigate_tree_for_evidence`` (complement nav, table supplement,
+        referenced-page gap-fill) on each file, then assesses whether the
+        aggregated evidence is rich enough to bypass Monte Carlo sampling.
+
+        Returns:
+            ``(evidence_dict, is_sufficient)`` where *evidence_dict* maps
+            file_path to raw evidence text, and *is_sufficient* indicates
+            that the direct-channel can replace ``_build_cluster``.
+        """
+        indexer = self._get_tree_indexer()
+        if indexer is None:
+            return {}, False
+
+        nav_fps = [fp for fp in file_paths[:self._DEEP_PRE_NAV_MAX_FILES]
+                   if indexer.has_tree(fp)]
+        if not nav_fps:
+            return {}, False
+
+        results = await asyncio.gather(
+            *[self._navigate_tree_for_evidence(fp, query) for fp in nav_fps],
+            return_exceptions=True,
+        )
+
+        evidence_dict: Dict[str, str] = {}
+        for fp, res in zip(nav_fps, results):
+            if isinstance(res, Exception):
+                await self._logger.warning(
+                    f"[Phase 2.5:DirectTree] Navigation failed for "
+                    f"{Path(fp).name}: {res}"
+                )
+            elif isinstance(res, str) and res.strip():
+                evidence_dict[fp] = res
+
+        if not evidence_dict:
+            return {}, False
+
+        combined = "\n\n".join(evidence_dict.values())
+        total_len = len(combined)
+        kw_coverage = self._compute_keyword_coverage(query, combined)
+
+        is_sufficient = (
+            total_len >= self._TREE_EVIDENCE_MIN_DIRECT_CHARS
+            and kw_coverage >= self._TREE_DIRECT_KW_THRESHOLD
+        )
+
+        await self._logger.info(
+            f"[Phase 2.5:DirectTree] {len(evidence_dict)} files, "
+            f"{total_len} chars, kw_cov={kw_coverage:.2f}, "
+            f"sufficient={is_sufficient}"
+        )
+        return evidence_dict, is_sufficient
 
     @classmethod
     def _classify_leaves(cls, leaves: list) -> Tuple[List[tuple], List, List]:
@@ -6315,13 +6721,45 @@ class AgenticSearch(BaseSearch):
     # Phase 4: Answer generation
     # ------------------------------------------------------------------
 
+    _INTENT_PROMPT_MAP = {
+        "lookup": ROI_LOOKUP_SYNTHESIS,
+        "computation": ROI_COMPUTATION_SYNTHESIS,
+        "comparison": ROI_COMPARISON_SYNTHESIS,
+    }
+
+    @classmethod
+    def _select_synthesis_prompt(
+        cls,
+        query: str,
+        evidence: str,
+        intent: str = "",
+        *,
+        document_context: Optional[str] = None,
+    ) -> str:
+        """Select and format the synthesis prompt based on query intent.
+
+        Falls back to ``ROI_RESULT_SUMMARY`` for unknown intents or when
+        the caller passes no intent (FAST mode compatibility).
+        """
+        template = cls._INTENT_PROMPT_MAP.get(intent, ROI_RESULT_SUMMARY)
+
+        prompt = template.format(user_input=query, text_content=evidence)
+
+        if document_context:
+            prompt = (
+                f"{prompt}\n\n### Document Context\n{document_context}"
+            )
+        return prompt
+
     async def _summarise_cluster(
         self, query: str, cluster: KnowledgeCluster,
+        intent: str = "",
     ) -> Tuple[str, bool, bool]:
         """Generate a final answer summary from a KnowledgeCluster.
 
-        Uses ``ROI_RESULT_SUMMARY`` (with precision / best-effort constraints)
-        for both FAST and DEEP modes, ensuring consistent answer quality.
+        When *intent* is provided, selects a specialised synthesis prompt
+        (lookup / computation / comparison).  Falls back to the general
+        ``ROI_RESULT_SUMMARY`` for FAST mode or unknown intents.
 
         Returns:
             ``(summary_text, should_save, should_answer)`` where:
@@ -6335,9 +6773,8 @@ class AgenticSearch(BaseSearch):
             f"{cluster.content if isinstance(cluster.content, str) else sep.join(cluster.content)}"
         )
 
-        result_sum_prompt = ROI_RESULT_SUMMARY.format(
-            user_input=query,
-            text_content=cluster_text_content,
+        result_sum_prompt = self._select_synthesis_prompt(
+            query, cluster_text_content, intent,
         )
 
         await self._logger.info("[Phase 4] Generating search result summary...")
@@ -6580,6 +7017,7 @@ class AgenticSearch(BaseSearch):
         tree_files: List[str],
         artifacts: Any,
         context: "SearchContext",
+        intent: str = "",
     ) -> Tuple[str, Optional["KnowledgeCluster"], str]:
         """Orchestrate the Deep Structured Reasoning pipeline.
 
@@ -6587,7 +7025,7 @@ class AgenticSearch(BaseSearch):
           1. Section map  — build from tree index top layers (no LLM)
           2. Section select — LLM picks relevant sections (1 LLM)
           3. Targeted extraction — pull pages + tables for sections (no LLM)
-          4. Synthesis — ROI_RESULT_SUMMARY on targeted evidence (1 LLM)
+          4. Synthesis — intent-aware prompt on targeted evidence (1 LLM)
           5. Recovery — if refused, expand sections and re-synthesize
 
         Returns ``(raw_llm_output, cluster, combined_evidence)`` where
@@ -6658,19 +7096,11 @@ class AgenticSearch(BaseSearch):
             if ctx_parts:
                 doc_context = "\n".join(ctx_parts)
 
-        # Synthesize answer using the unified ROI prompt
-        if doc_context:
-            from sirchmunk.llm.prompts import ROI_RESULT_SUMMARY_WITH_CONTEXT
-            synth_prompt = ROI_RESULT_SUMMARY_WITH_CONTEXT.format(
-                user_input=query,
-                text_content=combined_evidence,
-                document_context=doc_context,
-            )
-        else:
-            synth_prompt = ROI_RESULT_SUMMARY.format(
-                user_input=query,
-                text_content=combined_evidence,
-            )
+        # Synthesize answer using intent-aware prompt
+        synth_prompt = self._select_synthesis_prompt(
+            query, combined_evidence, intent,
+            document_context=doc_context,
+        )
 
         resp = await self.llm.achat(
             messages=[{"role": "user", "content": synth_prompt}],
@@ -6722,21 +7152,12 @@ class AgenticSearch(BaseSearch):
                 if not found_new:
                     break
                 combined_evidence = "\n\n---\n\n".join(expanded_parts)
-                if doc_context:
-                    synth_prompt = ROI_RESULT_SUMMARY_WITH_CONTEXT.format(
-                        user_input=query,
-                        text_content=combined_evidence[
-                            : self._DEEP_STRUCTURED_MAX_CHARS
-                        ],
-                        document_context=doc_context,
-                    )
-                else:
-                    synth_prompt = ROI_RESULT_SUMMARY.format(
-                        user_input=query,
-                        text_content=combined_evidence[
-                            : self._DEEP_STRUCTURED_MAX_CHARS
-                        ],
-                    )
+                synth_prompt = self._select_synthesis_prompt(
+                    query,
+                    combined_evidence[:self._DEEP_STRUCTURED_MAX_CHARS],
+                    intent,
+                    document_context=doc_context,
+                )
                 resp = await self.llm.achat(
                     messages=[{"role": "user", "content": synth_prompt}],
                     stream=True,

@@ -534,6 +534,178 @@ Return ONLY a JSON array of section indices (0-based) from the map above:
 
 
 # ---------------------------------------------------------------------------
+# DEEP mode query classification (Plan B)
+# ---------------------------------------------------------------------------
+
+DEEP_QUERY_CLASSIFY = """Classify this search query along two dimensions.
+
+Query: {query}
+
+1. **Complexity** — how many reasoning steps are needed:
+   - "simple": Direct lookup of a single value (e.g. "What was revenue in FY2023?")
+   - "moderate": Requires light computation from 1-2 data points (e.g. "What was the gross margin?")
+   - "complex": Multi-step computation, multi-period comparison, or cross-entity analysis
+
+2. **Intent** — what the user needs:
+   - "lookup": Find and extract a specific stated value
+   - "computation": Calculate a derived metric (ratio, growth rate, difference, average)
+   - "comparison": Compare values across time periods, segments, or companies
+
+Return ONLY valid JSON on a single line:
+{{"complexity": "simple", "intent": "lookup"}}
+"""
+
+# ---------------------------------------------------------------------------
+# Intent-specific synthesis prompts (Plan C)
+# ---------------------------------------------------------------------------
+
+ROI_LOOKUP_SYNTHESIS = """### Task
+Extract the specific value requested from the evidence and present it clearly.
+
+### Constraints
+1. **Language Continuity**: The output must be in the SAME language as the User Input.
+2. Find the EXACT value stated in the evidence. Do not compute or estimate.
+3. If multiple candidate values exist, select based on the closest match to the query's time period, entity, and metric.
+4. Quote the source passage containing the value.
+5. If the value is not explicitly stated in the evidence, mark SHOULD_ANSWER as "false".
+
+### Input Data
+- **User Input**: {user_input}
+- **Evidence**: {text_content}
+
+### Output Format
+<SUMMARY>
+**Source passage**: [Quote the exact text containing the answer]
+
+**Extracted value**: [The specific value found]
+</SUMMARY>
+<PRECISE_ANSWER>[value only, e.g. "$1,832 million", "Yes", "42%"]</PRECISE_ANSWER>
+<SHOULD_ANSWER>true/false</SHOULD_ANSWER>
+<SHOULD_SAVE>true/false</SHOULD_SAVE>
+"""
+
+ROI_COMPUTATION_SYNTHESIS = """### Task
+Answer the query by extracting data from the evidence and performing the required calculation.
+
+### Constraints
+1. **Language Continuity**: The output must be in the SAME language as the User Input.
+2. Follow this STRICT sequence — do NOT skip any step:
+   a) **DATA EXTRACTION**: List each required data point with its exact value and where you found it.
+   b) **FORMULA**: State the formula needed (e.g. Gross Margin = (Revenue - COGS) / Revenue).
+   c) **SUBSTITUTION**: Plug in the extracted values into the formula.
+   d) **CALCULATION**: Show arithmetic step by step. For each step, write the operation and its result.
+   e) **VERIFICATION**: Re-compute the final result independently to confirm.
+3. **Rounding**: Match the precision implied by the query. For percentages, use at most one decimal place unless asked for more. For dollar amounts, round to the nearest whole number in the stated unit.
+4. **Units**: Convert all values to consistent units before computing.
+5. If any required data point is missing, explicitly state what is missing and mark SHOULD_ANSWER as "false".
+
+### Input Data
+- **User Input**: {user_input}
+- **Evidence**: {text_content}
+
+### Output Format
+<SUMMARY>
+## Data Extraction
+| Data Point | Value | Source |
+|---|---|---|
+| [name] | [exact value] | [where found in evidence] |
+
+## Calculation
+**Formula**: [state formula]
+**Step 1**: [operation] = [result]
+**Step 2**: [operation] = [result]
+**Verification**: [re-compute to confirm]
+</SUMMARY>
+<PRECISE_ANSWER>[final computed value only]</PRECISE_ANSWER>
+<SHOULD_ANSWER>true/false</SHOULD_ANSWER>
+<SHOULD_SAVE>true/false</SHOULD_SAVE>
+"""
+
+ROI_COMPARISON_SYNTHESIS = """### Task
+Compare the requested values across the specified dimensions (time periods, entities, or segments).
+
+### Constraints
+1. **Language Continuity**: The output must be in the SAME language as the User Input.
+2. Extract values for EACH comparison dimension from the evidence.
+3. Present in a structured comparison table.
+4. State the direction and magnitude of difference or change.
+5. **Precision**: Use exact values from the evidence. When computing changes, show the arithmetic.
+6. If values for any comparison dimension are missing, state what is missing.
+
+### Input Data
+- **User Input**: {user_input}
+- **Evidence**: {text_content}
+
+### Output Format
+<SUMMARY>
+## Comparison
+| Dimension | Value | Source |
+|---|---|---|
+| [period/entity] | [value] | [where found] |
+
+## Analysis
+**Direction**: [increased/decreased/stable]
+**Magnitude**: [absolute and/or percentage change, with arithmetic shown]
+</SUMMARY>
+<PRECISE_ANSWER>[concise comparison result, e.g. "Increased from $1.2B to $1.5B (25% growth)"]</PRECISE_ANSWER>
+<SHOULD_ANSWER>true/false</SHOULD_ANSWER>
+<SHOULD_SAVE>true/false</SHOULD_SAVE>
+"""
+
+# ---------------------------------------------------------------------------
+# Evidence completeness check (Plan D)
+# ---------------------------------------------------------------------------
+
+EVIDENCE_COMPLETENESS_CHECK = """Given the query and available evidence, determine whether all data points needed to answer are present.
+
+### Query
+{query}
+
+### Query Type
+{intent}
+
+### Evidence (excerpt)
+{evidence_excerpt}
+
+### Instructions
+1. Identify the specific data points required to answer this query.
+2. Check whether each data point's actual value appears in the evidence.
+3. A data point is FOUND only if its numeric/factual value is explicitly stated.
+
+Return ONLY valid JSON on a single line:
+{{"complete": true, "missing": []}}
+or
+{{"complete": false, "missing": ["short description of what is missing"]}}
+"""
+
+# ---------------------------------------------------------------------------
+# Computation correction (Plan E)
+# ---------------------------------------------------------------------------
+
+COMPUTATION_CORRECTION = """Your previous calculation contained an arithmetic error. Please revise.
+
+### Query
+{query}
+
+### Your Previous Answer
+{original_answer}
+
+### Detected Error
+- Expression: {expression}
+- Your result: {llm_result}
+- Correct result: {correct_result}
+
+Revise your answer using the correct arithmetic. Keep the same analysis structure.
+
+<SUMMARY>
+[Corrected analysis with fixed calculation]
+</SUMMARY>
+<PRECISE_ANSWER>[Corrected final value]</PRECISE_ANSWER>
+<SHOULD_ANSWER>true</SHOULD_ANSWER>
+<SHOULD_SAVE>true</SHOULD_SAVE>
+"""
+
+# ---------------------------------------------------------------------------
 # Knowledge Compile prompts
 # ---------------------------------------------------------------------------
 
