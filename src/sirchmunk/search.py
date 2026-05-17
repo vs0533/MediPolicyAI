@@ -2708,6 +2708,8 @@ class AgenticSearch(BaseSearch):
     """Section map depth for agentic page selection."""
     _AGENTIC_EVIDENCE_MAX_CHARS: int = 40_000
     """Maximum evidence characters to feed to synthesis prompt."""
+    _SHORT_DOC_THRESHOLD: int = 30
+    """Documents with this many pages or fewer are extracted in full."""
 
     # --- Evidence acceptance thresholds ---
     _EVIDENCE_MIN_ACCEPT_LENGTH: int = 800
@@ -6754,11 +6756,16 @@ class AgenticSearch(BaseSearch):
             if fetched_pages else "None"
         )
 
+        evidence_summary = (
+            evidence_so_far[:2000] if evidence_so_far.strip() else "None yet"
+        )
+
         prompt = DEEP_PAGE_SELECT.format(
             query=query,
             data_requirements=reqs_str,
             section_map=section_map,
             fetched_pages=fetched_str,
+            evidence_summary=evidence_summary,
         )
         try:
             resp = await self.llm.achat(
@@ -6871,13 +6878,44 @@ class AgenticSearch(BaseSearch):
         outlines: Dict[str, str] = {}
         outlines_meta: Dict[str, List[Dict[str, Any]]] = {}
         file_total_pages: Dict[str, int] = {}
+        outline_target_files: List[str] = []
+
         for fp in target_files:
             tree = indexer.load_tree(fp) if indexer else None
             if tree and tree.total_pages:
                 file_total_pages[fp] = tree.total_pages
+            if fp not in file_total_pages:
+                try:
+                    from pypdf import PdfReader
+                    file_total_pages[fp] = len(PdfReader(fp).pages)
+                except Exception:
+                    pass
+
+            tp = file_total_pages.get(fp)
+            if tp and tp <= self._SHORT_DOC_THRESHOLD:
+                fname = Path(fp).name
+                try:
+                    all_pages = list(range(1, tp + 1))
+                    contents = DocumentExtractor.extract_pages(fp, all_pages)
+                    for pc in contents:
+                        if pc.content and pc.content.strip():
+                            evidence_parts.append(
+                                f"[{fname} p.{pc.page_number}]\n{pc.content}"
+                            )
+                    pages_extracted[fp] = set(all_pages)
+                    total_pages += tp
+                except Exception as exc:
+                    await self._logger.warning(
+                        f"[Phase 4] Full extraction of short doc {fname} failed: {exc}"
+                    )
+                    outline_target_files.append(fp)
+                continue
+            outline_target_files.append(fp)
+
+        for fp in outline_target_files:
+            tp = file_total_pages.get(fp)
 
             # Strategy 1: LLM-analyzed TOC pages (highest quality)
-            tp = file_total_pages.get(fp)
             toc_outline, toc_meta = await self._build_outline_from_toc_pages(fp, tp)
             if toc_outline.strip():
                 outlines[fp] = toc_outline
@@ -6885,6 +6923,7 @@ class AgenticSearch(BaseSearch):
                 continue
 
             # Strategy 2: Tree-index section map (fallback)
+            tree = indexer.load_tree(fp) if indexer else None
             if tree and tree.root:
                 outline, sec_meta = self._build_section_map(
                     tree.root, max_depth=self._AGENTIC_SECTION_MAP_DEPTH,
@@ -6892,13 +6931,33 @@ class AgenticSearch(BaseSearch):
                 if outline.strip():
                     outlines[fp] = outline
                     outlines_meta[fp] = sec_meta
+                    continue
+
+            # Strategy 3: Sampled content outline for docs with known page count
+            if tp:
+                sampled_outline, sampled_meta = self._build_sampled_outline(
+                    fp, tp,
+                )
+                outlines[fp] = sampled_outline
+                outlines_meta[fp] = sampled_meta
 
         current_reqs = data_reqs
+
+        if not outline_target_files and evidence_parts:
+            combined = "\n\n".join(evidence_parts)
+            return RetrievalResult(
+                evidence=combined[:self._AGENTIC_EVIDENCE_MAX_CHARS],
+                pages_extracted={
+                    fp: sorted(ps) for fp, ps in pages_extracted.items()
+                },
+                is_complete=True,
+                rounds_used=0,
+            )
 
         for round_idx in range(self._AGENTIC_MAX_ROUNDS):
             round_fetched_any = False
 
-            for fp in target_files:
+            for fp in outline_target_files:
                 if total_pages >= self._AGENTIC_MAX_TOTAL_PAGES:
                     break
 
@@ -7054,7 +7113,7 @@ class AgenticSearch(BaseSearch):
     # LLM-powered document outline from TOC pages
     # ------------------------------------------------------------------
 
-    _TOC_ANALYSIS_PAGES: List[int] = [1, 2, 3]
+    _TOC_ANALYSIS_PAGES: List[int] = [1, 2, 3, 4, 5]
 
     async def _build_outline_from_toc_pages(
         self,
@@ -7100,7 +7159,7 @@ class AgenticSearch(BaseSearch):
 
                 tp = total_pages or len(contents)
                 prompt = DEEP_TOC_ANALYSIS.format(
-                    toc_page_text=toc_text[:6000],
+                    toc_page_text=toc_text[:12000],
                     total_pages=tp,
                 )
                 resp = await self.llm.achat(
@@ -7133,7 +7192,6 @@ class AgenticSearch(BaseSearch):
     ) -> Tuple[str, List[Dict[str, Any]]]:
         """Convert raw TOC section list to outline string and metadata."""
         sections_meta: List[Dict[str, Any]] = []
-        lines: List[str] = []
 
         for i, sec in enumerate(sections_raw):
             if not isinstance(sec, dict):
@@ -7163,9 +7221,73 @@ class AgenticSearch(BaseSearch):
                 "summary": "",
             })
 
-            indent = "  " * level
-            page_str = f"(p{page_range[0]}-{page_range[1]})" if page_range else ""
-            lines.append(f"[{idx}] {indent}{title} {page_str}")
+        # Post-process: fix page_range errors from LLM inference
+        for i, sec in enumerate(sections_meta):
+            pr = sec.get("page_range")
+            if not pr:
+                continue
+            needs_fix = pr[1] < pr[0]
+            if not needs_fix and pr[1] == pr[0] and i + 1 < len(sections_meta):
+                next_pr = sections_meta[i + 1].get("page_range")
+                needs_fix = next_pr and next_pr[0] == pr[0]
+            if needs_fix:
+                for j in range(i + 1, len(sections_meta)):
+                    next_pr = sections_meta[j].get("page_range")
+                    if next_pr and next_pr[0] > pr[0]:
+                        pr[1] = next_pr[0] - 1
+                        break
+                else:
+                    pr[1] = total_pages or pr[0]
+
+        lines: List[str] = []
+        for sec in sections_meta:
+            pr = sec.get("page_range")
+            indent = "  " * sec["depth"]
+            page_str = f"(p{pr[0]}-{pr[1]})" if pr else ""
+            lines.append(f"[{sec['idx']}] {indent}{sec['title']} {page_str}")
+
+        return "\n".join(lines), sections_meta
+
+    @staticmethod
+    def _build_sampled_outline(
+        file_path: str,
+        total_pages: int,
+        interval: int = 20,
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Build an outline by sampling page content at regular intervals.
+
+        Used as a fallback when TOC parsing and tree indices are unavailable.
+        Gives the LLM enough context to make informed page selections.
+        """
+        sample_pages = list(range(1, total_pages + 1, interval))
+        if total_pages not in sample_pages:
+            sample_pages.append(total_pages)
+
+        sections_meta: List[Dict[str, Any]] = []
+        lines: List[str] = []
+
+        try:
+            contents = DocumentExtractor.extract_pages(file_path, sample_pages)
+            page_snippets = {
+                pc.page_number: (pc.content or "").strip()[:200]
+                for pc in contents if pc.content
+            }
+        except Exception:
+            page_snippets = {}
+
+        for i, pg in enumerate(sample_pages):
+            snippet = page_snippets.get(pg, "")
+            snippet_clean = " ".join(snippet.split())[:150]
+            next_pg = sample_pages[i + 1] if i + 1 < len(sample_pages) else total_pages
+            page_range = [pg, next_pg]
+
+            title = f'p{pg}: "{snippet_clean}..."' if snippet_clean else f"p{pg}"
+            sections_meta.append({
+                "idx": i, "title": title,
+                "page_range": page_range, "char_range": None,
+                "depth": 0, "node_id": f"sample_{i}", "summary": "",
+            })
+            lines.append(f"[{i}] {title} (p{page_range[0]}-{page_range[1]})")
 
         return "\n".join(lines), sections_meta
 

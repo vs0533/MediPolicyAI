@@ -424,7 +424,7 @@ Analyze the provided {text_content} and generate a concise summary in the form o
 3. **Style**: Keep it professional, objective, and clear. Avoid fluff.
 4. **Precision**: When the query asks for a specific value, ratio, number, percentage, or yes/no determination, you MUST compute it and state the precise result. Show key calculation steps when applicable.
 5. **Verify before answering**: For numerical calculations, complete ALL computation steps in the SUMMARY section FIRST. Only write the PRECISE_ANSWER tag AFTER you have verified the final result. If you discover an error during computation, use the corrected value in PRECISE_ANSWER.
-6. **Rounding**: Match the precision implied by the query. When the question asks for a value in specific units (e.g. "in USD millions"), round the final result to match the expected granularity. For percentages, use at most one decimal place unless the query explicitly asks for more. For dollar amounts, round to the nearest whole number in the stated unit. Example: if the raw calculation yields $8.738 billion and the expected unit is "USD billions", report $8.7 billion or $8.74 billion, not $8.738 billion.
+6. **Rounding**: Match the precision implied by the query. Dollar amounts: round to the nearest whole number in the stated unit. Percentages: round to the nearest whole number unless the query explicitly requests decimal precision. Example: $8,738 millions → "$8,738 million" or "$8.74 billion"; $381,603 thousands → "$382 million"; 36.47% → "36%".
 7. **Best-effort answering**: Always attempt to answer based on available evidence. When the query requests a specific metric, ratio, or calculation, compute it from whatever relevant data is available — even if the data is partial. Do not refuse to calculate a metric solely because you believe it is unconventional or less applicable for a given entity type. Only mark SHOULD_ANSWER as "false" when the evidence is entirely unrelated to the query.
 
 ### Input Data
@@ -467,7 +467,7 @@ Leverage the document context below for better understanding of the source mater
 3. **Style**: Keep it professional, objective, and clear. Avoid fluff.
 4. **Precision**: When the query asks for a specific value, ratio, number, percentage, or yes/no determination, you MUST compute it and state the precise result. Show key calculation steps when applicable.
 5. **Verify before answering**: For numerical calculations, complete ALL computation steps in the SUMMARY section FIRST. Only write the PRECISE_ANSWER tag AFTER you have verified the final result. If you discover an error during computation, use the corrected value in PRECISE_ANSWER.
-6. **Rounding**: Match the precision implied by the query. When the question asks for a value in specific units (e.g. "in USD millions"), round the final result to match the expected granularity. For percentages, use at most one decimal place unless the query explicitly asks for more. For dollar amounts, round to the nearest whole number in the stated unit. Example: if the raw calculation yields $8.738 billion and the expected unit is "USD billions", report $8.7 billion or $8.74 billion, not $8.738 billion.
+6. **Rounding**: Match the precision implied by the query. Dollar amounts: round to the nearest whole number in the stated unit. Percentages: round to the nearest whole number unless the query explicitly requests decimal precision. Example: $8,738 millions → "$8,738 million" or "$8.74 billion"; $381,603 thousands → "$382 million"; 36.47% → "36%".
 7. **Best-effort answering**: Always attempt to answer based on available evidence. When the query requests a specific metric, ratio, or calculation, compute it from whatever relevant data is available — even if the data is partial. Do not refuse to calculate a metric solely because you believe it is unconventional or less applicable for a given entity type. Only mark SHOULD_ANSWER as "false" when the evidence is entirely unrelated to the query.
 
 ### Document Context
@@ -564,10 +564,12 @@ Extract the specific value requested from the evidence and present it clearly.
 
 ### Constraints
 1. **Language Continuity**: The output must be in the SAME language as the User Input.
-2. Find the EXACT value stated in the evidence. Do not compute or estimate.
-3. If multiple candidate values exist, select based on the closest match to the query's time period, entity, and metric.
-4. Quote the source passage containing the value.
-5. If the value is not explicitly stated in the evidence, mark SHOULD_ANSWER as "false".
+2. Find the value stated in the evidence. If the exact total is not stated but its components are clearly present, compute it by summing the components.
+3. **Rounding**: When the query specifies units (e.g., "in USD millions"), convert and round the extracted value to match. Dollar amounts: round to the nearest whole number in the stated unit. Percentages: round to the nearest whole number unless the query asks for decimal precision. Examples: $302,578 thousands → "$303 million"; $381,603 thousands → "$382 million"; 36.47% → "36%".
+4. If multiple candidate values exist, select based on the closest match to the query's time period, entity, and metric.
+5. Quote the source passage containing the value.
+6. Only mark SHOULD_ANSWER as "false" when no relevant data exists in the evidence. Always prefer attempting an answer over refusing.
+7. When the evidence contains relevant data but you feel uncertain, still attempt to answer.
 
 ### Input Data
 - **User Input**: {user_input}
@@ -595,9 +597,14 @@ Answer the query by extracting data from the evidence and performing the require
    c) **SUBSTITUTION**: Plug in the extracted values into the formula.
    d) **CALCULATION**: Show arithmetic step by step. For each step, write the operation and its result.
    e) **VERIFICATION**: Re-compute the final result independently to confirm.
-3. **Rounding**: Match the precision implied by the query. For percentages, use at most one decimal place unless asked for more. For dollar amounts, round to the nearest whole number in the stated unit.
+3. **Rounding**: Round the final result to match the precision implied by the query.
+   - Dollar amounts: round to the nearest whole number in the stated unit. Example: $381,603 thousands → "$382 million".
+   - Percentages: round to 1 decimal place if the query says "round to one decimal place"; otherwise round to the nearest whole number.
+   - Ratios: round to 2 decimal places.
+   - When the query says "round to X decimal places", follow that exactly.
 4. **Units**: Convert all values to consistent units before computing.
 5. If any required data point is missing, explicitly state what is missing and mark SHOULD_ANSWER as "false".
+6. **Definition precision**: When computing financial ratios, use the broadest standard definition unless the query specifies otherwise. Quick ratio = (Current Assets - Inventories) / Current Liabilities. Asset turnover = Revenue / Average Total Assets.
 
 ### Input Data
 - **User Input**: {user_input}
@@ -629,8 +636,9 @@ Compare the requested values across the specified dimensions (time periods, enti
 2. Extract values for EACH comparison dimension from the evidence.
 3. Present in a structured comparison table.
 4. State the direction and magnitude of difference or change.
-5. **Precision**: Use exact values from the evidence. When computing changes, show the arithmetic.
-6. If values for any comparison dimension are missing, state what is missing.
+5. **Precision**: Use exact values from the evidence. When computing changes, show the arithmetic. Round results: dollar amounts to the nearest whole number in the stated unit, percentages to the nearest whole number.
+6. **"Best performing"** means highest growth rate or change rate, not highest absolute value, unless the query explicitly says "largest" or "highest revenue".
+7. If values for any comparison dimension are missing, state what is missing.
 
 ### Input Data
 - **User Input**: {user_input}
@@ -741,8 +749,12 @@ DEEP_PAGE_SELECT = """You are locating specific data in a document. Select pages
 ### Pages Already Fetched
 {fetched_pages}
 
+### Evidence Already Gathered
+{evidence_summary}
+
 ### Instructions
 - Reason about which sections contain the needed data based on section titles, summaries, and page ranges.
+- Consider what data has already been gathered to avoid fetching redundant content.
 - Financial statements (Income Statement, Balance Sheet, Cash Flow Statement) typically contain quantitative data needed for calculations.
 - Sections with tables are often high-value for data extraction.
 - Do NOT re-select pages listed in "Pages Already Fetched".
