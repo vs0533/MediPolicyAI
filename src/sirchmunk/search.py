@@ -1314,22 +1314,35 @@ class AgenticSearch(BaseSearch):
         missing: List[str],
         file_paths: List[str],
         artifacts: Any,
+        *,
+        scope: Optional["_PathScope"] = None,
+        nav_cache: Optional[Dict[str, str]] = None,
     ) -> Optional[str]:
         """Targeted evidence retrieval for identified gaps.
 
         Constructs focused sub-queries from *missing* descriptions and
         re-navigates tree indices or falls back to keyword retrieval.
 
+        When *scope* is provided, extra files drawn from
+        ``artifacts.tree_available_paths`` are filtered to the scope.
+        When *nav_cache* is provided, navigation results are cached to
+        avoid duplicate LLM calls across phases.
+
         Returns supplementary evidence text, or None.
         """
         sub_query = f"{query} — specifically: {'; '.join(missing)}"
         parts: List[str] = []
 
+        async def _navigate(fp: str, q: str) -> Optional[str]:
+            if nav_cache is not None:
+                return await self._cached_navigate_tree(fp, q, nav_cache)
+            return await self._navigate_tree_for_evidence(fp, q)
+
         indexer = self._get_tree_indexer()
         for fp in file_paths[:3]:
             try:
                 if indexer and indexer.has_tree(fp):
-                    ev = await self._navigate_tree_for_evidence(fp, sub_query)
+                    ev = await _navigate(fp, sub_query)
                     if ev and len(ev.strip()) > 100:
                         parts.append(
                             f"[Gap-fill: {Path(fp).name}]\n{ev}"
@@ -1345,10 +1358,11 @@ class AgenticSearch(BaseSearch):
             extra_fps = [
                 fp for fp in artifacts.tree_available_paths
                 if fp not in file_paths
+                and (not scope or scope.contains(fp))
             ][:2]
             for fp in extra_fps:
                 try:
-                    ev = await self._navigate_tree_for_evidence(fp, sub_query)
+                    ev = await _navigate(fp, sub_query)
                     if ev and len(ev.strip()) > 100:
                         parts.append(
                             f"[Gap-fill extra: {Path(fp).name}]\n{ev}"
@@ -2001,6 +2015,7 @@ class AgenticSearch(BaseSearch):
 
         # --- Adaptive compile artifact detection (shared with FAST) ---
         _scope = _PathScope(paths)
+        _nav_cache: Dict[str, str] = {}
         artifacts = self._detect_compile_artifacts(paths)
 
         # ==============================================================
@@ -2143,10 +2158,9 @@ class AgenticSearch(BaseSearch):
 
         # --- Phase 2.5: Full tree evidence collection for DEEP mode ---
         _tree_evidence: Dict[str, str] = {}
-        _tree_sufficient = False
         if tree_hits:
-            _tree_evidence, _tree_sufficient = (
-                await self._collect_deep_tree_evidence(tree_hits, query)
+            _tree_evidence = await self._collect_deep_tree_evidence(
+                tree_hits, query, scope=_scope, nav_cache=_nav_cache,
             )
         _pre_nav_evidence = _tree_evidence
 
@@ -2184,21 +2198,7 @@ class AgenticSearch(BaseSearch):
             await self._logger.info(f"[Phase 3] Merged {len(merged_files)} unique candidate files")
 
         cluster: Optional[KnowledgeCluster] = None
-        if _tree_sufficient and _tree_evidence:
-            combined_tree_ev = "\n\n---\n\n".join(
-                f"[Source: {Path(fp).name}]\n{ev}"
-                for fp, ev in _tree_evidence.items()
-            )
-            cluster = self._make_answer_cluster(
-                query, combined_tree_ev[:5000], "DTE",
-                file_paths=list(_tree_evidence.keys()),
-            )
-            cluster.content = combined_tree_ev
-            await self._logger.info(
-                f"[Phase 3:DirectTree] Tree evidence sufficient "
-                f"({len(combined_tree_ev)} chars), bypassing Monte Carlo"
-            )
-        elif merged_files:
+        if merged_files:
             cluster = await self._build_cluster(
                 query=query, file_paths=merged_files,
                 query_keywords=query_keywords, top_k_files=top_k_files,
@@ -2259,6 +2259,7 @@ class AgenticSearch(BaseSearch):
                 )
                 gap_evidence = await self._fill_evidence_gaps(
                     query, missing, merged_files, artifacts,
+                    scope=_scope, nav_cache=_nav_cache,
                 )
                 if gap_evidence:
                     if isinstance(cluster.content, list):
@@ -2283,11 +2284,13 @@ class AgenticSearch(BaseSearch):
         _sr_files: List[str] = []
         if _query_complexity != "simple":
             if tree_hits:
-                _sr_files = list(tree_hits[: self._DEEP_STRUCTURED_MAX_FILES])
+                _scoped_hits = [fp for fp in tree_hits if _scope.contains(fp)]
+                _sr_files = _scoped_hits[: self._DEEP_STRUCTURED_MAX_FILES]
             elif artifacts and artifacts.tree_available_paths:
-                _sr_files = list(artifacts.tree_available_paths)[
-                    : self._DEEP_STRUCTURED_MAX_FILES
-                ]
+                _sr_files = [
+                    fp for fp in artifacts.tree_available_paths
+                    if _scope.contains(fp)
+                ][: self._DEEP_STRUCTURED_MAX_FILES]
 
         if _sr_files:
             await self._logger.info(
@@ -2519,6 +2522,16 @@ class AgenticSearch(BaseSearch):
         # Step 2: LLM intent classification (cheap, stream=False)
         operation = await detect_doc_intent(query, self.llm, self.llm_usages)
         if operation is None:
+            return None
+
+        # Computation/comparison queries need the full evidence pipeline
+        if re.search(
+            r'\b(?:ratio|margin|growth.?rate|turnover|coverage'
+            r'|what is (?:the )?fy\d|calculate|compute'
+            r'|improv(?:ing|ed)|declin(?:ing|ed)'
+            r'|which .{0,30}(?:best|worst|most|least|highest|lowest))\b',
+            query, re.IGNORECASE,
+        ):
             return None
 
         filenames = ", ".join(Path(d.path).name for d in doc_files)
@@ -2879,11 +2892,6 @@ class AgenticSearch(BaseSearch):
     _EVIDENCE_KEYWORD_COVERAGE_THRESHOLD: float = 0.5
     """Minimum keyword coverage ratio for heuristic override."""
 
-    # --- Plan A: Evidence channel unification ---
-    _TREE_EVIDENCE_MIN_DIRECT_CHARS: int = 2000
-    """Minimum tree evidence length to bypass Monte Carlo and feed directly to synthesis."""
-    _TREE_DIRECT_KW_THRESHOLD: float = 0.3
-    """Minimum keyword coverage for tree evidence to qualify for the direct channel."""
     _NUMERIC_INTENT_KEYWORDS: frozenset = frozenset({
         "revenue", "margin", "ratio", "ebitda", "income", "profit", "loss",
         "cash", "debt", "equity", "eps", "dpo", "growth", "rate",
@@ -4730,35 +4738,65 @@ class AgenticSearch(BaseSearch):
         )
         return evidence
 
+    async def _cached_navigate_tree(
+        self,
+        file_path: str,
+        query: str,
+        nav_cache: Dict[str, str],
+    ) -> Optional[str]:
+        """``_navigate_tree_for_evidence`` with per-query dedup cache."""
+        cache_key = f"{file_path}::{query}"
+        if cache_key in nav_cache:
+            return nav_cache[cache_key]
+        result = await self._navigate_tree_for_evidence(file_path, query)
+        if isinstance(result, str) and result.strip():
+            nav_cache[cache_key] = result
+        return result
+
     async def _collect_deep_tree_evidence(
         self,
         file_paths: List[str],
         query: str,
-    ) -> Tuple[Dict[str, str], bool]:
+        *,
+        scope: Optional["_PathScope"] = None,
+        nav_cache: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, str]:
         """Full tree navigation for DEEP mode primary files.
 
         Runs ``_navigate_tree_for_evidence`` (complement nav, table supplement,
-        referenced-page gap-fill) on each file, then assesses whether the
-        aggregated evidence is rich enough to bypass Monte Carlo sampling.
+        referenced-page gap-fill) on each file.  Returns a dict mapping
+        file paths to raw evidence text.  The evidence is used to
+        **supplement** (not replace) Monte Carlo sampling.
 
-        Returns:
-            ``(evidence_dict, is_sufficient)`` where *evidence_dict* maps
-            file_path to raw evidence text, and *is_sufficient* indicates
-            that the direct-channel can replace ``_build_cluster``.
+        When *scope* is provided, only files within the search path scope
+        are navigated — prevents cross-document evidence contamination.
+        When *nav_cache* is provided, results are cached to avoid
+        duplicate navigation across pipeline phases.
         """
         indexer = self._get_tree_indexer()
         if indexer is None:
-            return {}, False
+            return {}
+
+        if scope:
+            file_paths = [fp for fp in file_paths if scope.contains(fp)]
+            if not file_paths:
+                return {}
 
         nav_fps = [fp for fp in file_paths[:self._DEEP_PRE_NAV_MAX_FILES]
                    if indexer.has_tree(fp)]
         if not nav_fps:
-            return {}, False
+            return {}
 
-        results = await asyncio.gather(
-            *[self._navigate_tree_for_evidence(fp, query) for fp in nav_fps],
-            return_exceptions=True,
-        )
+        if nav_cache is not None:
+            results = await asyncio.gather(
+                *[self._cached_navigate_tree(fp, query, nav_cache) for fp in nav_fps],
+                return_exceptions=True,
+            )
+        else:
+            results = await asyncio.gather(
+                *[self._navigate_tree_for_evidence(fp, query) for fp in nav_fps],
+                return_exceptions=True,
+            )
 
         evidence_dict: Dict[str, str] = {}
         for fp, res in zip(nav_fps, results):
@@ -4770,24 +4808,13 @@ class AgenticSearch(BaseSearch):
             elif isinstance(res, str) and res.strip():
                 evidence_dict[fp] = res
 
-        if not evidence_dict:
-            return {}, False
-
-        combined = "\n\n".join(evidence_dict.values())
-        total_len = len(combined)
-        kw_coverage = self._compute_keyword_coverage(query, combined)
-
-        is_sufficient = (
-            total_len >= self._TREE_EVIDENCE_MIN_DIRECT_CHARS
-            and kw_coverage >= self._TREE_DIRECT_KW_THRESHOLD
-        )
-
-        await self._logger.info(
-            f"[Phase 2.5:DirectTree] {len(evidence_dict)} files, "
-            f"{total_len} chars, kw_cov={kw_coverage:.2f}, "
-            f"sufficient={is_sufficient}"
-        )
-        return evidence_dict, is_sufficient
+        if evidence_dict:
+            total_len = sum(len(v) for v in evidence_dict.values())
+            await self._logger.info(
+                f"[Phase 2.5:DirectTree] {len(evidence_dict)} files, "
+                f"{total_len} chars"
+            )
+        return evidence_dict
 
     @classmethod
     def _classify_leaves(cls, leaves: list) -> Tuple[List[tuple], List, List]:
