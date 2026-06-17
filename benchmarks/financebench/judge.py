@@ -166,6 +166,23 @@ class FinanceBenchLLMJudge:
     _CONFIDENCE_THRESHOLD: float = 0.7
     _MAX_RETRIES: int = 2
 
+    _NUMERIC_EQUIVALENCE_TOLERANCE: float = 0.02
+    """Relative tolerance for numeric equivalence fast-path.
+
+    Two values are considered equivalent if
+    ``|a - b| / max(|a|, |b|) <= tolerance``.
+    Handles legitimate rounding differences (e.g. ``$8.74B`` vs ``$8.70B``
+    derived from ``$8,738M`` rounded to billions).
+    """
+
+    _NUMERIC_ABSOLUTE_TOLERANCE: float = 0.3
+    """Absolute tolerance floor for small values (percentage points, ratios).
+
+    Activated only when ``max(|a|, |b|) < 10`` so that small numerical
+    answers (e.g. ratios, percentage points) are not penalised by the
+    relative tolerance alone.
+    """
+
     # Coverage evaluation prompt
     _COVERAGE_PROMPT: str = """\
 You are evaluating whether a system's response contains ANY useful information \
@@ -245,6 +262,37 @@ Respond ONLY with a JSON object (no markdown, no extra text):
                 "equivalent": True,
                 "confidence": 1.0,
                 "reasoning": "Normalized exact match",
+                "cached": False,
+                "error": None,
+                "tokens_used": 0,
+            }
+
+        # --- Numeric equivalence fast-path ---
+        # Handles legitimate rounding differences (e.g. $8.74B vs $8.70B) before
+        # invoking the LLM Judge. Returns None when the comparison is ambiguous
+        # or non-numeric, in which case we fall through to the LLM.
+        _numeric_eq = self._check_numeric_equivalence(
+            prediction,
+            gold_answer,
+            self._NUMERIC_EQUIVALENCE_TOLERANCE,
+        )
+        if _numeric_eq is not None:
+            pred_val = self._normalize_numeric_answer(prediction)
+            gold_val = self._normalize_numeric_answer(gold_answer)
+            logger.debug(
+                "[Judge] Numeric fast-path: pred=%s, gold=%s, equiv=%s",
+                pred_val,
+                gold_val,
+                _numeric_eq,
+            )
+            return {
+                "equivalent": _numeric_eq,
+                "confidence": 0.95 if _numeric_eq else 0.90,
+                "reasoning": (
+                    "Numeric fast-path: values are equivalent within tolerance"
+                    if _numeric_eq
+                    else "Numeric fast-path: values differ beyond tolerance"
+                ),
                 "cached": False,
                 "error": None,
                 "tokens_used": 0,
@@ -436,6 +484,186 @@ Respond ONLY with a JSON object (no markdown, no extra text):
 
     # ------------------------------------------------------------------
     # Helpers
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Numeric equivalence fast-path
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_numeric_answer(text: str) -> Optional[float]:
+        """Extract and normalize the primary numeric value from an answer.
+
+        Handles:
+            - Currency with magnitude suffixes: ``$1.5B`` -> ``1_500_000_000``
+            - Percentages: ``15.3%`` -> ``0.153``
+            - Plain numbers with thousand separators: ``1,577`` -> ``1577``
+            - Negative values and parenthetical negatives: ``(1.5)`` -> ``-1.5``
+            - Word-form magnitudes: ``$1.5 billion`` -> ``1_500_000_000``
+
+        Returns:
+            The normalized ``float`` value, or ``None`` if the text does not
+            contain a single dominant numeric answer (multiple inconsistent
+            numbers, or text dominated by qualitative description).
+        """
+        if not text or not isinstance(text, str):
+            return None
+        s = text.strip()
+        if not s:
+            return None
+
+        # Time-period notation guard: tokens like FY2018, Q3 2019, 2018-2019,
+        # or bare 4-digit years should never be treated as numeric answers --
+        # a 1-year delta is well within 2% tolerance and would otherwise yield
+        # false-positive equivalence (e.g. FY2018 vs FY2019).
+        if re.search(r"\b(?:FY|Q[1-4]|H[12]|CY)\s*\d{2,4}\b", s, re.IGNORECASE):
+            return None
+        # Pure year token(s) without any other numeric content -> ambiguous.
+        non_year_numeric = re.search(
+            r"(?<!\d)(?!(?:19|20)\d{2}(?!\d))\d", s
+        )
+        if not non_year_numeric and re.search(r"\b(?:19|20)\d{2}\b", s):
+            return None
+
+        # Capture: optional sign / opening paren, optional currency, digits
+        # (with thousand separators), optional fractional part, optional
+        # magnitude suffix (B/M/K/T or full word), optional closing paren,
+        # optional percent.
+        pattern = re.compile(
+            r"""
+            (?P<sign>-|\()?                                  # negative or open paren
+            \s*
+            \$?                                              # optional currency symbol
+            \s*
+            (?P<num>\d{1,3}(?:,\d{3})+|\d+)                  # integer body
+            (?P<frac>\.\d+)?                                 # optional decimal
+            \s*
+            (?P<suffix>billion|million|thousand|trillion|bn|mn|[BMKT])?  # magnitude
+            \s*
+            (?P<close>\))?                                   # close paren
+            \s*
+            (?P<pct>%)?                                      # percent sign
+            """,
+            re.IGNORECASE | re.VERBOSE,
+        )
+
+        multipliers = {
+            "b": 1e9, "bn": 1e9, "billion": 1e9,
+            "m": 1e6, "mn": 1e6, "million": 1e6,
+            "k": 1e3, "thousand": 1e3,
+            "t": 1e12, "trillion": 1e12,
+        }
+
+        values: list[float] = []
+        for match in pattern.finditer(s):
+            num_str = match.group("num").replace(",", "")
+            frac = match.group("frac") or ""
+            try:
+                val = float(num_str + frac)
+            except ValueError:
+                continue
+
+            sign = match.group("sign")
+            close = match.group("close")
+            if sign == "-" or (sign == "(" and close == ")"):
+                val = -val
+
+            suffix = (match.group("suffix") or "").lower()
+            if suffix:
+                val *= multipliers.get(suffix, 1.0)
+
+            if match.group("pct"):
+                val /= 100.0
+
+            values.append(val)
+
+        if not values:
+            return None
+
+        # If multiple numeric tokens were captured, only accept if they are
+        # all numerically consistent (e.g. "$1,577 (or $1.577K)"). Otherwise
+        # the answer is ambiguous and we fall through to the LLM Judge.
+        primary = values[0]
+        for other in values[1:]:
+            if primary == 0.0 and other == 0.0:
+                continue
+            denom = max(abs(primary), abs(other))
+            if denom == 0.0:
+                continue
+            if abs(primary - other) / denom > 1e-3:
+                return None
+
+        # Conservative qualitative-content guard: if the answer contains many
+        # alphabetic content words beyond unit / filler tokens, treat it as
+        # a free-form description and fall through to the LLM Judge.
+        unit_or_filler = {
+            "billion", "million", "thousand", "trillion", "bn", "mn",
+            "b", "m", "k", "t",
+            "percent", "pct",
+            "usd", "eur", "gbp", "jpy", "cny", "rmb",
+            "dollar", "dollars",
+            "approximately", "approx", "about", "around",
+            "and", "or", "of", "the", "a", "an",
+            "is", "was", "were", "are", "be",
+        }
+        words = re.findall(r"[A-Za-z]+", s)
+        content_words = [w for w in words if w.lower() not in unit_or_filler]
+        if len(content_words) > 5:
+            return None
+
+        return primary
+
+    @staticmethod
+    def _check_numeric_equivalence(
+        prediction: str,
+        gold: str,
+        tolerance: float = 0.02,
+    ) -> Optional[bool]:
+        """Fast-path numeric equivalence check before LLM Judge.
+
+        Extracts the primary numeric value from both ``prediction`` and
+        ``gold`` answer, normalizes units, and compares within a relative
+        ``tolerance``.
+
+        Args:
+            prediction: Model's answer text.
+            gold: Ground-truth answer text.
+            tolerance: Maximum allowed relative difference
+                ``|a - b| / max(|a|, |b|)``.
+
+        Returns:
+            ``True``  - values are numerically equivalent (within tolerance).
+            ``False`` - values are clearly different (beyond tolerance).
+            ``None``  - cannot determine (non-numeric or ambiguous); the
+            caller should fall through to the LLM Judge.
+        """
+        pred_val = FinanceBenchLLMJudge._normalize_numeric_answer(prediction)
+        gold_val = FinanceBenchLLMJudge._normalize_numeric_answer(gold)
+
+        if pred_val is None or gold_val is None:
+            return None
+
+        # Both exactly zero -> equivalent.
+        if pred_val == 0.0 and gold_val == 0.0:
+            return True
+
+        denom = max(abs(pred_val), abs(gold_val))
+        if denom == 0.0:
+            # One is zero, the other is not -> clearly different.
+            return False
+
+        rel_diff = abs(pred_val - gold_val) / denom
+        if rel_diff <= tolerance:
+            return True
+        # Absolute tolerance floor for small values (percentage points, ratios)
+        abs_diff = abs(pred_val - gold_val)
+        if (max(abs(pred_val), abs(gold_val)) < 10.0
+                and abs_diff <= FinanceBenchLLMJudge._NUMERIC_ABSOLUTE_TOLERANCE):
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Refusal detection
     # ------------------------------------------------------------------
 
     @staticmethod

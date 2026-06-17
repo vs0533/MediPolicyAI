@@ -385,6 +385,12 @@ class AgenticSearch(BaseSearch):
         self.spec_path.mkdir(parents=True, exist_ok=True)
         self._spec_lock = asyncio.Lock()  # guards concurrent spec writes
 
+        # LLM-piggybacked multi-source intent score, populated by
+        # _probe_keywords from the same Phase 1 keyword-extraction
+        # response.  None means the LLM block was missing/unparseable
+        # and callers should fall back to the heuristic.
+        self._multi_source_intent: Optional[float] = None
+
     def update_log_callback(self, log_callback: LogCallback = None) -> None:
         """Replace the per-request log callback on all sub-components.
 
@@ -2658,7 +2664,7 @@ class AgenticSearch(BaseSearch):
     """Maximum referenced-but-uncovered pages to extract as gap-fill."""
 
     # --- Table evidence budgets ---
-    _TABLE_EVIDENCE_DEFAULT_CHARS: int = 20_000
+    _TABLE_EVIDENCE_DEFAULT_CHARS: int = 25_000
     """Default max_chars for _format_table_evidence."""
     _TABLE_EVIDENCE_PER_RANGE_CHARS: int = 8_000
     """Max chars for per-page-range table supplement in tree nav."""
@@ -2677,6 +2683,15 @@ class AgenticSearch(BaseSearch):
     _DEEP_CROSS_SECTION_MIN_EVIDENCE: int = 8_000
     """Cross-section table supplement is skipped when existing tree-nav
     evidence already exceeds this threshold (chars), preventing overload."""
+
+    _QUANTITATIVE_INTENT_THRESHOLD: float = 0.55
+    """Minimum quantitative intent score to force cross-section table
+    retrieval regardless of existing evidence volume."""
+
+    _TABLE_CROSS_SECTION_BUDGET_SCALE: float = 1.0
+    """Maximum additional budget multiplier for cross-section tables
+    when quantitative intent is high.  Budget scales linearly from
+    1x to (1 + scale)x as intent goes from threshold to 1.0."""
 
     # --- Self-correction expanded sampling ---
     _SELF_CORRECT_EXPANDED_NAV_RESULTS: int = 10
@@ -2709,6 +2724,9 @@ class AgenticSearch(BaseSearch):
     """Section map depth for agentic page selection."""
     _AGENTIC_EVIDENCE_MAX_CHARS: int = 40_000
     """Maximum evidence characters to feed to synthesis prompt."""
+    _TWO_STAGE_INTENTS: frozenset = frozenset({"computation", "comparison"})
+    """Intents that benefit from a two-stage (extraction + synthesis) answer
+    pipeline. Other intents skip Stage 1 to avoid redundant LLM cost."""
     _SHORT_DOC_THRESHOLD: int = 30
     """Documents with this many pages or fewer are extracted in full."""
 
@@ -4877,6 +4895,17 @@ class AgenticSearch(BaseSearch):
         ]
 
     _TABLE_RELEVANCE_MIN_PREFIX = 5
+    # Regex pattern for numeric entities commonly found in financial /
+    # data tables.  Used by _score_table_novelty for entity-level
+    # coverage-gain scoring (a table's value lies in its numbers).
+    _NUMERIC_ENTITY_PATTERN = re.compile(
+        r"(?:"
+        r"[\$€£¥]\s*[\d,]+(?:\.\d+)?[BMKTbmkt]?"  # currency: $1,577 $1.2B
+        r"|[\d,]+(?:\.\d+)?\s*%"                    # percentage: 15.3%
+        r"|[\d,]+(?:\.\d+)?\s*[BMKTbmkt]\b"         # magnitude: 1.2B 500M
+        r"|(?<!\w)[\d,]{2,}(?:\.\d+)?(?!\w)"        # plain numbers ≥2 digits: 1,577 or 2023
+        r")"
+    )
     _TABLE_STRUCTURE_BONUS: float = 0.25
     """Bonus score for tables exhibiting structured data characteristics
     (high row count, numeric density).  Applied additively to the keyword
@@ -4966,6 +4995,168 @@ class AgenticSearch(BaseSearch):
         row_score = min(rows / 30.0, 1.0)
         num_score = min(numeric_ratio / 0.4, 1.0)
         return (row_score * 0.5 + num_score * 0.5)
+
+    @staticmethod
+    def _extract_multi_source_intent(content: str) -> Optional[float]:
+        """Extract multi_source_intent score from LLM keyword response.
+
+        Parses the <MULTI_SOURCE_INTENT> block emitted by the keyword
+        extraction prompt.  Returns None if the block is missing or
+        unparseable (caller should fall back to heuristic).
+        """
+        match = re.search(
+            r"<MULTI_SOURCE_INTENT>\s*([\d.]+)\s*</MULTI_SOURCE_INTENT>",
+            content,
+        )
+        if not match:
+            return None
+        try:
+            score = float(match.group(1))
+            return max(0.0, min(1.0, score))  # clamp to [0, 1]
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _detect_quantitative_intent(query: str) -> float:
+        """[Fallback] Detect quantitative intent via structural heuristics.
+
+        Preferred path: ``self._multi_source_intent`` set by Phase 1 LLM
+        piggyback.  This method is used only when LLM extraction fails.
+
+        Uses generic linguistic signals (numeric patterns, comparison words,
+        mathematical operators, temporal spans) rather than domain-specific
+        vocabulary to maintain generalizability.
+
+        Four sub-signals contribute, each scored in [0, 1]:
+
+        1. **Numeric token density** — fraction of query tokens containing
+           digits (years, amounts, identifiers).
+        2. **Comparison / trend cues** — generic words such as ``vs``,
+           ``compare``, ``change``, ``growth``, ``increase``, ``decrease``,
+           ``higher``, ``lower``, ``between``.
+        3. **Math / aggregation cues** — ``average``, ``ratio``,
+           ``percentage``, ``total``, ``sum``, ``margin``, ``rate``, ``per``.
+        4. **Temporal span cues** — explicit year ranges (``FY20XX-FY20XX``,
+           ``2018-2020``) and multi-period phrases (``year-over-year``,
+           ``multi-year``, ``3-year``).
+
+        The final score is the maximum of the sub-scores, so any single
+        strong signal is sufficient to flag a quantitative query.
+
+        Returns a score in [0.0, 1.0] where higher values indicate stronger
+        quantitative intent requiring data from multiple document sections.
+        """
+        if not query:
+            return 0.0
+
+        q_lower = query.lower()
+        tokens = q_lower.split()
+        if not tokens:
+            return 0.0
+
+        # 1. Numeric pattern density (scaled so ~25% digit tokens -> 1.0)
+        numeric_tokens = sum(
+            1 for t in tokens if any(c.isdigit() for c in t)
+        )
+        numeric_score = min(
+            (numeric_tokens / len(tokens)) * 4.0, 1.0,
+        )
+
+        _strip_chars = ",.?!:;%\"'()[]"
+
+        # 2. Comparison / trend signals
+        comp_words = {
+            "vs", "versus", "compare", "compared", "comparison",
+            "change", "changed", "growth", "grew", "grow", "grown",
+            "increase", "increased", "decrease", "decreased",
+            "higher", "lower", "between", "delta", "difference",
+            "trend", "trends",
+        }
+        comp_hits = sum(
+            1 for t in tokens if t.strip(_strip_chars) in comp_words
+        )
+        comp_score = 1.0 if comp_hits >= 1 else 0.0
+
+        # 3. Math / aggregation signals
+        math_words = {
+            "average", "avg", "mean", "median", "ratio", "ratios",
+            "percentage", "percent", "total", "sum", "margin",
+            "margins", "rate", "rates", "per", "cumulative",
+            "aggregate",
+        }
+        math_hits = sum(
+            1 for t in tokens if t.strip(_strip_chars) in math_words
+        )
+        math_score = 1.0 if math_hits >= 1 else 0.0
+
+        # 4. Temporal span signals
+        span_score = 0.0
+        if re.search(
+            r"fy?\s*\d{2,4}\s*[-\u2013\u2014to ]+\s*fy?\s*\d{2,4}",
+            q_lower,
+        ):
+            span_score = 1.0
+        elif re.search(
+            r"\b(?:19|20)\d{2}\s*[-\u2013\u2014]+\s*(?:(?:19|20)?\d{2})\b",
+            q_lower,
+        ):
+            span_score = 1.0
+        else:
+            span_phrases = (
+                "multi-year", "multi year", "year-over-year",
+                "year over year", "yoy", "y/y", "qoq", "q/q",
+                "3-year", "5-year", "two-year", "three-year",
+                "four-year", "five-year", "ten-year", "period",
+            )
+            if any(p in q_lower for p in span_phrases):
+                span_score = 1.0
+
+        return max(numeric_score, comp_score, math_score, span_score)
+
+    @classmethod
+    def _score_table_novelty(
+        cls,
+        table_markdown: str,
+        existing_evidence: str,
+        query_tokens: Set[str],
+    ) -> float:
+        """Score table novelty via numeric entity coverage gain with keyword gating.
+
+        Combines two signals:
+        1. **Numeric novelty**: fraction of numeric entities in the table that
+           are absent from existing evidence (core value of tables = numbers).
+        2. **Keyword relevance**: fraction of query tokens present in the table
+           (ensures topical alignment, not just numeric diversity).
+
+        Final score = novelty * max(keyword_coverage, 0.2), where the 0.2
+        floor prevents complete suppression of tables that may use different
+        terminology for the same concepts.
+
+        Falls back to a length-based heuristic (capped at 0.3) when the table
+        contains no extractable numeric entities.
+        """
+        if not table_markdown:
+            return 0.0
+
+        # Keyword relevance gate
+        table_tokens = {t.lower() for t in table_markdown.split() if len(t) >= 2}
+        keyword_coverage = (
+            len(query_tokens & table_tokens) / max(len(query_tokens), 1)
+        )
+
+        table_nums = set(cls._NUMERIC_ENTITY_PATTERN.findall(table_markdown))
+        if not table_nums:
+            # Textual table fallback: length heuristic gated by keyword relevance
+            return min(len(table_markdown) / 2000.0, 0.3) * max(keyword_coverage, 0.2)
+
+        evidence_nums = set(
+            cls._NUMERIC_ENTITY_PATTERN.findall(existing_evidence or "")
+        )
+        novel_nums = table_nums - evidence_nums
+        novelty = len(novel_nums) / len(table_nums)
+
+        # Final score: numeric novelty gated by keyword relevance
+        return novelty * max(keyword_coverage, 0.2)
 
     @staticmethod
     def _deduplicate_table_sections(
@@ -5414,10 +5605,33 @@ class AgenticSearch(BaseSearch):
             pass
 
         # ── Phase 5.5: Cross-section table supplement (conditional) ──
-        # Only supplements when existing evidence is below threshold
-        # to prevent evidence overload for queries already well-served.
+        # Triggers when either (a) existing tree-nav evidence is below
+        # threshold, OR (b) the query carries strong quantitative intent
+        # that warrants pulling numerical tables from distant document
+        # sections regardless of evidence volume.
         _current_ev_len = sum(len(p) for p in parts)
-        if _all_tables and leaves and _current_ev_len < self._DEEP_CROSS_SECTION_MIN_EVIDENCE:
+        # Prefer LLM-piggybacked intent (computed in Phase 1 at zero cost);
+        # fall back to heuristic if unavailable.
+        _quant_intent = (
+            self._multi_source_intent
+            if self._multi_source_intent is not None
+            else self._detect_quantitative_intent(query)
+        )
+        _should_cross_section = (
+            _current_ev_len < self._DEEP_CROSS_SECTION_MIN_EVIDENCE
+            or _quant_intent >= self._QUANTITATIVE_INTENT_THRESHOLD
+        )
+        print(
+            f"SEARCH_WIKI_DEBUG [N5.5] phase5_5_decision: "
+            f"intent={_quant_intent:.3f}, "
+            f"source={'piggyback' if self._multi_source_intent is not None else 'heuristic'}, "
+            f"threshold={self._QUANTITATIVE_INTENT_THRESHOLD}, "
+            f"current_ev_len={_current_ev_len}, "
+            f"min_evidence={self._DEEP_CROSS_SECTION_MIN_EVIDENCE}, "
+            f"triggered={_should_cross_section}",
+            flush=True,
+        )
+        if _all_tables and leaves and _should_cross_section:
             _leaf_page_set: Set[int] = set()
             for _lf in leaves:
                 _pr = getattr(_lf, "page_range", None)
@@ -5432,10 +5646,39 @@ class AgenticSearch(BaseSearch):
                 and t["page_number"] not in _leaf_page_set
             ]
             if _cross_tables:
+                # Dynamic budget: scale linearly with quantitative intent.
+                _cross_budget = int(
+                    self._TABLE_CROSS_SECTION_CHARS
+                    * (1.0 + self._TABLE_CROSS_SECTION_BUDGET_SCALE
+                       * _quant_intent)
+                )
+                # Re-rank cross-section tables by relevance + structure
+                # + complementarity (information gain over existing
+                # evidence) so that data-dense tables filling gaps are
+                # preferred over those duplicating retrieved content.
+                _query_tokens: Set[str] = {
+                    tok for tok in query.lower().split() if len(tok) >= 2
+                }
+                _q_frozen = frozenset(_query_tokens)
+                _existing_ev = "\n\n".join(parts)
+                _struct_bonus = self._TABLE_STRUCTURE_BONUS
+                _scored: List[Tuple[float, int, Dict[str, Any]]] = []
+                for _idx, _t in enumerate(_cross_tables):
+                    _md = _t.get("markdown", "") or ""
+                    _rel = self._score_table_relevance(_md, _q_frozen)
+                    _stru = _struct_bonus * self._score_table_structure(_md)
+                    _comp = self._score_table_novelty(
+                        _md, _existing_ev, _query_tokens,
+                    )
+                    _scored.append((_rel + _stru + _comp, _idx, _t))
+                _scored.sort(key=lambda x: (-x[0], x[1]))
+                _ranked_cross_tables = [t for _, _, t in _scored]
+                # query="" preserves our explicit complementarity ranking
+                # rather than letting _format_table_evidence re-sort.
                 _cross_ev = self._format_table_evidence(
-                    _cross_tables,
-                    max_chars=self._TABLE_CROSS_SECTION_CHARS,
-                    query=query,
+                    _ranked_cross_tables,
+                    max_chars=_cross_budget,
+                    query="",
                 )
                 if _cross_ev:
                     parts.append(
@@ -5444,7 +5687,9 @@ class AgenticSearch(BaseSearch):
                     print(
                         f"SEARCH_WIKI_DEBUG [N5.3] cross_section_tables: "
                         f"uncovered_tables={len(_cross_tables)}, "
-                        f"ev_len={len(_cross_ev)}",
+                        f"ev_len={len(_cross_ev)}, "
+                        f"quantitative_intent={_quant_intent:.2f}, "
+                        f"budget={_cross_budget}",
                         flush=True,
                     )
 
@@ -5671,6 +5916,11 @@ class AgenticSearch(BaseSearch):
             stream=False,
         )
         self.llm_usages.append(kw_response.usage)
+
+        # --- Piggyback: extract multi-source intent from the same LLM response ---
+        _piggyback_intent = self._extract_multi_source_intent(kw_response.content)
+        if _piggyback_intent is not None:
+            self._multi_source_intent = _piggyback_intent
 
         keyword_sets = self._extract_and_validate_multi_level_keywords(
             kw_response.content, num_levels=2,
@@ -7059,6 +7309,30 @@ class AgenticSearch(BaseSearch):
                 intent=data_reqs.intent,
             )
 
+        # Fallback: if zero evidence after loop, extract first N pages
+        if not evidence_parts:
+            await self._logger.warning(
+                f"[Phase 4] Zero evidence after retrieval loop, "
+                f"activating broad fallback"
+            )
+            _fallback_map = self._broad_fallback_pages(
+                outline_target_files,
+                file_total_pages=file_total_pages,
+                pages_extracted=pages_extracted,
+            )
+            for fp, pages in _fallback_map.items():
+                try:
+                    contents = DocumentExtractor.extract_pages(fp, pages)
+                    for pc in contents:
+                        if pc.content and pc.content.strip():
+                            evidence_parts.append(
+                                f"[{Path(fp).name} p.{pc.page_number}]\n"
+                                f"{pc.content}"
+                            )
+                    pages_extracted.setdefault(fp, set()).update(pages)
+                except Exception:
+                    continue
+
         combined = "\n\n".join(evidence_parts)
         return RetrievalResult(
             evidence=combined[:self._AGENTIC_EVIDENCE_MAX_CHARS],
@@ -7068,6 +7342,86 @@ class AgenticSearch(BaseSearch):
             is_complete=False,
             rounds_used=self._AGENTIC_MAX_ROUNDS,
         )
+
+    def _broad_fallback_pages(
+        self,
+        target_files: List[str],
+        file_total_pages: Dict[str, int],
+        pages_extracted: Dict[str, Set[int]],
+    ) -> Dict[str, List[int]]:
+        """Broad fallback: select pages from first target file.
+
+        Activated when normal page selection yields zero evidence.
+        Uses a simple heuristic: financial data typically appears in
+        the first third of the document (after TOC but before appendices).
+
+        Args:
+            target_files: Candidate files in priority order.
+            file_total_pages: Map of file path to total page count.
+            pages_extracted: Map of file path to already-extracted pages.
+
+        Returns:
+            Map of file path to a small list of fallback page numbers.
+        """
+        result: Dict[str, List[int]] = {}
+        for fp in target_files[:1]:  # Only first file
+            total = file_total_pages.get(fp)
+            if not total:
+                try:
+                    from pypdf import PdfReader
+                    total = len(PdfReader(fp).pages)
+                except Exception:
+                    total = 0
+            if not total:
+                continue
+            fetched = pages_extracted.get(fp, set())
+            # Target pages: first 4 + middle 4
+            start_pages = list(range(1, min(5, total + 1)))
+            mid = total // 3
+            mid_pages = list(range(mid, min(mid + 4, total + 1)))
+            pages = sorted(set(start_pages + mid_pages) - fetched)
+            if pages:
+                result[fp] = pages[:8]
+        return result
+
+    async def _focus_evidence(
+        self,
+        query: str,
+        evidence: str,
+    ) -> Optional[str]:
+        """Stage 1: Focus evidence by selecting relevant verbatim passages.
+
+        Performs a focused LLM call to identify and quote the most relevant
+        passages from the evidence. The output contains exact quotes (no
+        transformation) that direct the synthesis LLM's attention to the
+        right data, reducing noise without precision loss.
+
+        Returns the focused evidence block, or None if the call fails —
+        in which case the caller falls back to single-stage synthesis.
+        """
+        from sirchmunk.llm.prompts import EVIDENCE_FOCUS
+
+        prompt = EVIDENCE_FOCUS.format(
+            user_input=query,
+            text_content=evidence,
+        )
+        try:
+            resp = await self.llm.achat(
+                messages=[{"role": "user", "content": prompt}],
+                stream=False,
+            )
+            self.llm_usages.append(resp.usage)
+            content = resp.content or ""
+            if "<FOCUSED_EVIDENCE>" not in content:
+                return None
+            match = re.search(
+                r"<FOCUSED_EVIDENCE>(.*?)</FOCUSED_EVIDENCE>",
+                content,
+                re.DOTALL,
+            )
+            return match.group(1).strip() if match else None
+        except Exception:
+            return None
 
     async def _synthesize_from_retrieval(
         self,
@@ -7084,6 +7438,17 @@ class AgenticSearch(BaseSearch):
         evidence = retrieval.evidence
         if formula and intent == "computation":
             evidence = f"[Required Formula: {formula}]\n\n{evidence}"
+
+        # ── Stage 1: Structured data extraction (computation/comparison) ──
+        # For intents that require precise numeric reasoning, first extract
+        # structured data points to reduce ambiguity for the synthesis LLM.
+        if intent in self._TWO_STAGE_INTENTS:
+            focused = await self._focus_evidence(query, evidence)
+            if focused:
+                evidence = (
+                    f"[Key Evidence Passages]\n{focused}\n\n"
+                    f"[Full Evidence]\n{evidence}"
+                )
 
         synth_prompt = self._select_synthesis_prompt(
             query, evidence, intent,

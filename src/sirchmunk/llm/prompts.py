@@ -73,6 +73,23 @@ Output {num_levels} separate JSON-like dicts within their respective tags, follo
 {{"translated_keyword1": idf_value, "translated_keyword2": idf_value}}
 </KEYWORDS_ALT>
 
+<MULTI_SOURCE_INTENT>
+0.7
+</MULTI_SOURCE_INTENT>
+
+### Multi-Source Data Dependency Assessment:
+After the keyword blocks, assess whether this query requires synthesizing numerical/tabular data from **multiple distinct document sections** to produce a complete answer.
+
+<MULTI_SOURCE_INTENT>
+score (a single float between 0.0 and 1.0)
+</MULTI_SOURCE_INTENT>
+
+Scoring guidelines:
+- 0.0-0.2: Query can be answered from a single paragraph or table (e.g., "What was revenue in 2023?")
+- 0.3-0.5: Query may benefit from 2 sources (e.g., "What was the gross margin?")
+- 0.6-0.8: Query requires cross-referencing multiple tables/sections (e.g., "Compare revenue growth across 3 years")
+- 0.9-1.0: Query requires aggregation across many document sections (e.g., "What is the 5-year average capex as percentage of revenue?")
+
 ### User Query:
 {query_placeholder}
 
@@ -420,12 +437,14 @@ Analyze the provided {text_content} and generate a concise summary in the form o
 
 ### Constraints
 1. **Language Continuity**: The output must be in the SAME language as the User Input.
-2. **Format**: Use Markdown (headings, bullet points, and bold text) for high readability.
-3. **Style**: Keep it professional, objective, and clear. Avoid fluff.
-4. **Precision**: When the query asks for a specific value, ratio, number, percentage, or yes/no determination, you MUST compute it and state the precise result. Show key calculation steps when applicable.
-5. **Verify before answering**: For numerical calculations, complete ALL computation steps in the SUMMARY section FIRST. Only write the PRECISE_ANSWER tag AFTER you have verified the final result. If you discover an error during computation, use the corrected value in PRECISE_ANSWER.
-6. **Rounding**: When converting units (thousands → millions, millions → billions), round to the nearest whole number in the target unit if result ≥10; use 2 decimal places if result <10. Examples: $5,466,312 thousands → "$5,466 million"; $389 million → "$0.39 billion". Percentages: round to 1 decimal place. When the query specifies a rounding rule, follow it exactly.
-7. **Best-effort answering**: Always attempt to answer based on available evidence. When the query requests a specific metric, ratio, or calculation, compute it from whatever relevant data is available — even if the data is partial. Do not refuse to calculate a metric solely because you believe it is unconventional or less applicable for a given entity type. Only mark SHOULD_ANSWER as "false" when the evidence is entirely unrelated to the query.
+2. ONLY use data explicitly stated in the evidence. If a required value is not found in the evidence, output SHOULD_ANSWER=false rather than inferring, estimating, or using your own knowledge. Never fabricate numbers that do not appear verbatim in the evidence.
+3. When the question asks to LIST or IDENTIFY specific items (securities, products, subsidiaries, etc.), enumerate ALL individual instances with their exact identifiers (ticker symbols, ISIN codes, names, amounts) — do not summarize into generic categories.
+4. **Format**: Use Markdown (headings, bullet points, and bold text) for high readability.
+5. **Style**: Keep it professional, objective, and clear. Avoid fluff.
+6. **Precision**: When the query asks for a specific value, ratio, number, percentage, or yes/no determination, you MUST compute it and state the precise result. Show key calculation steps when applicable.
+7. **Verify before answering**: For numerical calculations, complete ALL computation steps in the SUMMARY section FIRST. Only write the PRECISE_ANSWER tag AFTER you have verified the final result. If you discover an error during computation, use the corrected value in PRECISE_ANSWER.
+8. **Rounding**: When converting units (thousands → millions, millions → billions), round to the nearest whole number in the target unit if result ≥10; use 2 decimal places if result <10. Examples: $5,466,312 thousands → "$5,466 million"; $389 million → "$0.39 billion". Percentages: round to 1 decimal place. When the query specifies a rounding rule, follow it exactly.
+9. Base your answer strictly on the provided evidence. If the evidence contains relevant data, use it to construct the best possible answer. If required data points are absent from the evidence, set SHOULD_ANSWER=false — do not guess or approximate.
 
 ### Input Data
 - **User Input**: {user_input}
@@ -564,18 +583,21 @@ Extract the specific value requested from the evidence and present it clearly.
 
 ### Constraints
 1. **Language Continuity**: The output must be in the SAME language as the User Input.
-2. Find the value stated in the evidence. If the exact total is not stated but its components are clearly present, compute it by summing the components.
-3. **Rounding**: When converting units (e.g., thousands → millions), round to the nearest whole number in the target unit IF the result is ≥10. If the result is <10, use 2 decimal places. Examples: $5,466,312 thousands → "$5,466 million"; $302,578 thousands → "$303 million"; $389 million → "$0.39 billion". Percentages: round to 1 decimal place. When the query specifies a rounding rule, follow it exactly.
-4. If multiple candidate values exist, select based on the closest match to the query's time period, entity, and metric.
-5. Quote the source passage containing the value.
-6. Only mark SHOULD_ANSWER as "false" when no relevant data exists in the evidence. Always prefer attempting an answer over refusing.
-7. When the evidence contains relevant data but you feel uncertain, still attempt to answer.
-8. **Answer format**:
+2. ONLY use data explicitly stated in the evidence. If a required value is not found in the evidence, output SHOULD_ANSWER=false rather than inferring, estimating, or using your own knowledge. Never fabricate numbers that do not appear verbatim in the evidence.
+3. When the question asks to LIST or IDENTIFY specific items (securities, products, subsidiaries, etc.), enumerate ALL individual instances with their exact identifiers (ticker symbols, ISIN codes, names, amounts) — do not summarize into generic categories.
+4. Find the value stated in the evidence. If the exact total is not stated but its components are clearly present, compute it by summing the components.
+5. **Rounding**: When converting units (e.g., thousands → millions), round to the nearest whole number in the target unit IF the result is ≥10. If the result is <10, use 2 decimal places. Examples: $5,466,312 thousands → "$5,466 million"; $302,578 thousands → "$303 million"; $389 million → "$0.39 billion". Percentages: round to 1 decimal place. When the query specifies a rounding rule, follow it exactly.
+6. If multiple candidate values exist, select based on the closest match to the query's time period, entity, and metric.
+7. Quote the source passage containing the value.
+8. Only mark SHOULD_ANSWER as "false" when no relevant data exists in the evidence. Always prefer attempting an answer over refusing.
+9. When the evidence contains relevant data but you feel uncertain, still attempt to answer.
+10. **Answer format**:
    - For yes/no questions (e.g., "Has X increased?", "Did the company…?", "Does X maintain…?", "Is X healthy?"), PRECISE_ANSWER **MUST** begin with "Yes" or "No" as the very first word. Then provide a brief qualifier.
    - For identification questions (e.g., "What is the largest segment?", "Which company had the highest…?"), PRECISE_ANSWER should state the name/label, not the numeric value.
    - For value questions (e.g., "What was total revenue?"), PRECISE_ANSWER should state the numeric value with units.
    - When asked about the "nature", "purpose", "composition", or "breakdown" of something, describe what it IS and its proportional components (e.g., "87% relates to employee liabilities"), not just the total dollar amount.
    - When listing items (e.g., "Which securities are registered?"), provide the COMPLETE list from the evidence, not just one example.
+11. When asked about a financial ratio or metric that has a standard definition (e.g., current ratio, quick ratio, DPO), list ALL component values used in the calculation with their exact source locations in the evidence, even if the question only asks for the final ratio value.
 
 ### Input Data
 - **User Input**: {user_input}
@@ -602,24 +624,27 @@ Answer the query by extracting data from the evidence and performing the require
    b) **FORMULA**: State the formula needed (e.g. Gross Margin = (Revenue - COGS) / Revenue).
    c) **SUBSTITUTION**: Plug in the extracted values into the formula.
    d) **CALCULATION**: Show arithmetic step by step. For each step, write the operation and its result.
-   e) **VERIFICATION**: Re-compute the final result independently to confirm.
-3. **Rounding**:
+   e) **VERIFICATION**: (i) For each data point used, quote the exact source text from evidence that contains it. (ii) Re-compute the result independently. (iii) If the re-computed result differs from step d, use the re-computed value.
+3. ONLY use data explicitly stated in the evidence. If a required value is not found in the evidence, output SHOULD_ANSWER=false rather than inferring, estimating, or using your own knowledge. Never fabricate numbers that do not appear verbatim in the evidence.
+4. When the evidence contains multiple versions of similar financial data (e.g., restated vs original, consolidated vs segment, quarterly vs annual), use the CONSOLIDATED and most RECENT version unless the question explicitly specifies otherwise. State which version you selected.
+5. **Rounding**:
    - Dollar amounts: when converting units, round to the nearest whole number in the target unit IF the result is ≥10. If the result is <10 in the target unit, use 2 decimal places. Examples: $381,603 thousands → "$382 million"; $5,466,312 thousands → "$5,466 million"; $389 million → "$0.39 billion".
    - Percentages: round to 1 decimal place.
    - Ratios: round to 2 decimal places.
    - Per-share values: round to 2 decimal places.
    - When the query specifies "round to X decimal places", follow that exactly.
-4. **Units**: Convert all values to consistent units before computing.
-5. If any required data point is missing, explicitly state what is missing and mark SHOULD_ANSWER as "false".
-6. **Financial ratio definitions**:
+6. **Units**: Convert all values to consistent units before computing.
+7. If any required data point is missing, explicitly state what is missing and mark SHOULD_ANSWER as "false".
+8. **Financial ratio definitions**:
    - **Quick ratio** = (Cash and Cash Equivalents + Short-term Investments + Net Receivables) / Total Current Liabilities. Do NOT include inventories, prepaid expenses, or other current assets in the numerator.
    - **Interest coverage ratio** = EBIT / Interest Expense. If EBIT is negative, the coverage ratio is zero (or negative) — a company cannot service debt from negative earnings.
    - **Asset turnover** = Revenue / Average Total Assets.
    - A quick ratio below 1.0x generally indicates the company does NOT have a reasonably healthy liquidity position.
-7. **Answer format**:
+9. **Answer format**:
    - For yes/no questions (e.g., "Does X have healthy liquidity?", "Has X improved?", "Does X maintain…?"), PRECISE_ANSWER **MUST** begin with "Yes" or "No" as the very first word.
    - For identification questions, state the name/label, not just the number.
    - When asked about "nature", "purpose", or "composition", describe qualitative aspects and proportions, not just total amounts.
+10. **DEFINITION ALIGNMENT**: Before extracting data, explicitly state the standard definition of the requested metric (e.g., Quick Ratio = (Cash + Short-term Investments + Accounts Receivable) / Current Liabilities). Use ONLY the components specified in the standard definition. If the question names a specific metric (e.g., "EBIT"), you MUST use exactly that metric — do NOT substitute a different metric (e.g., EBITDA, EBITDAR) even if the specified one is unavailable or negative. If the required metric yields a zero or negative result, report that result as-is.
 
 ### Input Data
 - **User Input**: {user_input}
@@ -636,11 +661,43 @@ Answer the query by extracting data from the evidence and performing the require
 **Formula**: [state formula]
 **Step 1**: [operation] = [result]
 **Step 2**: [operation] = [result]
-**Verification**: [re-compute to confirm]
+**Verification**:
+  - Re-check each extracted value: confirm it appears VERBATIM in the evidence (quote the exact text)
+  - Re-compute the final result independently
+  - If any extracted value cannot be confirmed verbatim, flag it and re-extract from evidence
 </SUMMARY>
 <PRECISE_ANSWER>[final computed value only]</PRECISE_ANSWER>
 <SHOULD_ANSWER>true/false</SHOULD_ANSWER>
 <SHOULD_SAVE>true/false</SHOULD_SAVE>
+"""
+
+EVIDENCE_FOCUS = """You are an evidence retrieval specialist.
+
+### Task
+Given the question below, identify the MOST RELEVANT passages from the evidence that contain data needed to answer it. Quote each passage VERBATIM — do not modify, round, or summarize any numbers.
+
+### Question
+{user_input}
+
+### Evidence
+{text_content}
+
+### Output Format
+<FOCUSED_EVIDENCE>
+[For each relevant passage, provide:]
+
+**Source**: [page number, table name, or section heading]
+**Quote**: "[exact verbatim text from the evidence containing the relevant data]"
+**Relevance**: [1-sentence explanation of what this provides for the answer]
+
+</FOCUSED_EVIDENCE>
+
+### Rules
+- Quote text EXACTLY as it appears — preserve all numbers, symbols, and formatting
+- Include enough context around numbers to disambiguate (e.g., include row/column headers for table cells)
+- Select 3-8 most relevant passages; prefer fewer high-quality quotes over many low-quality ones
+- Do NOT calculate, infer, transform, or assess data completeness
+- Do NOT state whether the question can or cannot be answered
 """
 
 ROI_COMPARISON_SYNTHESIS = """### Task
@@ -648,13 +705,16 @@ Compare the requested values across the specified dimensions (time periods, enti
 
 ### Constraints
 1. **Language Continuity**: The output must be in the SAME language as the User Input.
-2. Extract values for EACH comparison dimension from the evidence.
-3. Present in a structured comparison table.
-4. State the direction and magnitude of difference or change.
-5. **Rounding**: When computing changes or growth rates, round percentages to 1 decimal place. When converting units (e.g., thousands → millions), round to nearest whole number in target unit if result ≥10; otherwise use 2 decimal places.
-6. **"Best performing"** means highest growth rate or change rate, not highest absolute value, unless the query explicitly says "largest" or "highest revenue".
-7. If values for any comparison dimension are missing, state what is missing.
-8. **Answer format**: For yes/no questions ("Has X improved?", "Was there any change?"), PRECISE_ANSWER **MUST** begin with "Yes" or "No" as the very first word, followed by the comparison details.
+2. ONLY use data explicitly stated in the evidence. If a required value is not found in the evidence, output SHOULD_ANSWER=false rather than inferring, estimating, or using your own knowledge. Never fabricate numbers that do not appear verbatim in the evidence.
+3. When the evidence contains multiple versions of similar financial data (e.g., restated vs original, consolidated vs segment, quarterly vs annual), use the CONSOLIDATED and most RECENT version unless the question explicitly specifies otherwise. State which version you selected.
+4. Extract values for EACH comparison dimension from the evidence.
+5. Present in a structured comparison table.
+6. State the direction and magnitude of difference or change.
+7. **Rounding**: When computing changes or growth rates, round percentages to 1 decimal place. When converting units (e.g., thousands → millions), round to nearest whole number in target unit if result ≥10; otherwise use 2 decimal places.
+8. **"Best performing"** means highest growth rate or change rate, not highest absolute value, unless the query explicitly says "largest" or "highest revenue".
+9. If values for any comparison dimension are missing, state what is missing.
+10. **Answer format**: For yes/no questions ("Has X improved?", "Was there any change?"), PRECISE_ANSWER **MUST** begin with "Yes" or "No" as the very first word, followed by the comparison details.
+11. **PERFORMANCE CRITERIA**: When asked which item "performed best" or "performed worst", clarify the criterion BEFORE comparing. "Top-line performance" or "revenue performance" typically means GROWTH RATE (year-over-year change), not absolute value, unless the question explicitly says "highest revenue". State your chosen criterion and justify it from the question wording.
 
 ### Input Data
 - **User Input**: {user_input}
