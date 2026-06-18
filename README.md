@@ -156,6 +156,11 @@ It serves as a unified intelligent hub for AI agents, delivering deep insights a
 
 ## 🎉 News
 
+* 🚀 **Jun 18, 2026**: Sirchmunk v0.0.8
+  - **Knowledge Compile (Beta)**: New `sirchmunk compile` command for offline document pre-processing — builds hierarchical tree indices and knowledge clusters to boost retrieval precision in both FAST and DEEP modes.
+  - **Search pipeline integration**: Compile artifacts (tree indices, document catalog, summary index) are automatically detected and used by the search pipeline when available; graceful fallback to standard retrieval when absent.
+  - **Health check utility**: `sirchmunk compile --lint` performs system-level knowledge integrity checks with optional `--fix` for auto-repair.
+  - **I/O optimization**: File hash reuse across the pipeline to eliminate redundant I/O; configurable model names and processing limits replace previous hardcoded values.
 * 🚀 **Apr 13, 2026**: Sirchmunk v0.0.7
   - **C/S deployment hardening**: Strict `allowed_paths` enforcement with symlink detection for remote mode; per-IP rate limiting and JSON Lines audit logging; local mode remains unrestricted for backward compatibility.
   - **Remote file upload**: Three-mode upload UI (Select Files / Select Folder / drag-and-drop); server-side pre-upload duplicate detection with skip/overwrite options; manifest-based storage accounting.
@@ -359,7 +364,34 @@ sirchmunk search "query" --api --api-url http://localhost:8584
 | `sirchmunk web serve --dev` | Start API + Next.js dev server (hot-reload) |
 | `sirchmunk mcp serve` | Start the MCP server (stdio/HTTP) |
 | `sirchmunk mcp version` | Show MCP version information |
+| `sirchmunk compile` | Compile documents into knowledge indices **(Beta)** |
 | `sirchmunk version` | Show version information |
+
+#### Knowledge Compile (Beta)
+
+Pre-process document collections into hierarchical tree indices and knowledge clusters to improve retrieval accuracy. This is an **optional** step — search works without it, but compile artifacts can significantly boost precision for large document sets.
+
+```bash
+# Compile documents (incremental by default)
+sirchmunk compile --paths /path/to/documents
+
+# Full recompile (ignore cache)
+sirchmunk compile --paths /path/to/documents --full
+
+# Shallow mode (skip tree indexing, faster)
+sirchmunk compile --paths /path/to/documents --shallow
+
+# Check compile status
+sirchmunk compile --paths /path/to/documents --status
+
+# Run knowledge health checks
+sirchmunk compile --lint --work-path ~/.sirchmunk
+
+# Auto-fix lint issues
+sirchmunk compile --lint --fix --work-path ~/.sirchmunk
+```
+
+> **Note**: This feature is in **Beta**. The compile artifacts are automatically detected by the search pipeline — no additional configuration is needed after compilation.
 
 ---
 

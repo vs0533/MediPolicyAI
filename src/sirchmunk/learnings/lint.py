@@ -69,6 +69,8 @@ class LintReport:
 class KnowledgeLint:
     """Validate the health of the knowledge network and apply auto-fixes."""
 
+    _CLUSTER_SCAN_LIMIT: int = 10_000
+
     def __init__(
         self,
         knowledge_storage: KnowledgeStorage,
@@ -106,7 +108,7 @@ class KnowledgeLint:
 
     async def _check_clusters(self, report: LintReport, auto_fix: bool) -> None:
         """Validate each knowledge cluster."""
-        all_clusters = await self._storage.find("", limit=10000)
+        all_clusters = await self._storage.find("", limit=self._CLUSTER_SCAN_LIMIT)
         report.total_clusters_checked = len(all_clusters)
 
         for cluster in all_clusters:

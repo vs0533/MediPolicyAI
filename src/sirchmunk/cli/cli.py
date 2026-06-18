@@ -48,6 +48,19 @@ def _setup_logging(log_level: str = "INFO"):
     )
 
 
+_DEFAULT_LLM_MODEL = "gpt-5.2"
+
+
+def _create_llm(*, api_key: Optional[str] = None):
+    """Create an OpenAIChat instance from environment variables."""
+    from sirchmunk.llm.openai_chat import OpenAIChat
+    return OpenAIChat(
+        base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
+        api_key=api_key or os.getenv("LLM_API_KEY", ""),
+        model=os.getenv("LLM_MODEL_NAME", _DEFAULT_LLM_MODEL),
+    )
+
+
 def _load_env_file(env_file: Path) -> bool:
     """Load environment variables from .env file.
 
@@ -350,7 +363,7 @@ def _run_base_init(work_path: Path) -> int:
         print("  ✗ LLM_API_KEY is not set")
         print(f"    Set it in {env_file}")
 
-    llm_model = os.getenv("LLM_MODEL_NAME", "gpt-5.2")
+    llm_model = os.getenv("LLM_MODEL_NAME", _DEFAULT_LLM_MODEL)
     print(f"  • LLM_MODEL_NAME: {llm_model}")
 
     llm_base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
@@ -625,7 +638,7 @@ async def _search_local(
     # Read LLM config from environment at runtime (after .env is loaded)
     llm_base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
     llm_api_key = os.getenv("LLM_API_KEY", "")
-    llm_model_name = os.getenv("LLM_MODEL_NAME", "gpt-5.2")
+    llm_model_name = os.getenv("LLM_MODEL_NAME", _DEFAULT_LLM_MODEL)
 
     # Validate API key
     if not llm_api_key:
@@ -1338,11 +1351,7 @@ async def _compile_run(
         print("   Configure it in ~/.sirchmunk/.env or set the environment variable.")
         return 1
 
-    llm = OpenAIChat(
-        base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
-        api_key=llm_api_key,
-        model=os.getenv("LLM_MODEL_NAME", "gpt-5.2"),
-    )
+    llm = _create_llm(api_key=llm_api_key)
 
     searcher = AgenticSearch(llm=llm, work_path=str(work_path))
 
@@ -1396,11 +1405,7 @@ async def _compile_status(paths: list, work_path: Path) -> int:
     from sirchmunk.search import AgenticSearch
     from sirchmunk.llm.openai_chat import OpenAIChat
 
-    llm = OpenAIChat(
-        base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
-        api_key=os.getenv("LLM_API_KEY", ""),
-        model=os.getenv("LLM_MODEL_NAME", "gpt-5.2"),
-    )
+    llm = _create_llm()
 
     searcher = AgenticSearch(llm=llm, work_path=str(work_path))
     status = await searcher.compile_status(paths=paths)
@@ -1421,13 +1426,8 @@ async def _compile_status(paths: list, work_path: Path) -> int:
 async def _compile_lint(work_path: Path, auto_fix: bool = False) -> int:
     """Run knowledge lint checks."""
     from sirchmunk.search import AgenticSearch
-    from sirchmunk.llm.openai_chat import OpenAIChat
 
-    llm = OpenAIChat(
-        base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
-        api_key=os.getenv("LLM_API_KEY", ""),
-        model=os.getenv("LLM_MODEL_NAME", "gpt-5.2"),
-    )
+    llm = _create_llm()
 
     searcher = AgenticSearch(llm=llm, work_path=str(work_path))
     report = await searcher.compile_lint(auto_fix=auto_fix)

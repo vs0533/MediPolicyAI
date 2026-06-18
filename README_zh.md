@@ -152,6 +152,11 @@
 
 ## 🎉 News
 
+* 🚀 **2026年6月18日**: Sirchmunk v0.0.8
+  - **知识编译（Beta）**：新增 `sirchmunk compile` 命令，支持离线文档预处理 — 构建层次化树索引与知识集群，提升 FAST 和 DEEP 模式的检索精度。
+  - **搜索管线集成**：编译产物（树索引、文档目录、摘要索引）在可用时自动检测并接入搜索管线；无编译产物时平滑回退至标准检索。
+  - **健康检查工具**：`sirchmunk compile --lint` 执行知识完整性检查，支持 `--fix` 自动修复。
+  - **I/O 优化**：管线内文件哈希复用，消除冗余 I/O；模型名称与处理上限改为动态配置，移除硬编码。
 * 🚀 **2026年4月13日**: Sirchmunk v0.0.7
   - **C/S 部署加固**：远程模式下严格的 `allowed_paths` 路径约束与符号链接检测；按 IP 速率限制与 JSON Lines 审计日志；本地模式保持向后兼容。
   - **远程文件上传**：三种上传模式（选择文件 / 选择文件夹 / 拖拽上传）；服务端上传前重复检测，支持跳过/覆盖；基于 manifest 的存储统计。
@@ -358,7 +363,34 @@ sirchmunk search "查询" --api --api-url http://localhost:8584
 | `sirchmunk web serve --dev` | 开发模式，Next.js 热重载 |
 | `sirchmunk mcp serve` | 启动 MCP 服务器（stdio/HTTP） |
 | `sirchmunk mcp version` | 显示 MCP 版本信息 |
+| `sirchmunk compile` | 编译文档为知识索引 **（Beta）** |
 | `sirchmunk version` | 显示版本信息 |
+
+#### 知识编译（Beta）
+
+将文档集合预处理为层次化树索引与知识集群，以提升检索精度。这是一个**可选**步骤 — 不编译也能正常搜索，但编译产物可显著提升大规模文档集的检索准确率。
+
+```bash
+# 编译文档（默认增量模式）
+sirchmunk compile --paths /path/to/documents
+
+# 全量重编译（忽略缓存）
+sirchmunk compile --paths /path/to/documents --full
+
+# 浅层模式（跳过树索引，更快）
+sirchmunk compile --paths /path/to/documents --shallow
+
+# 查看编译状态
+sirchmunk compile --paths /path/to/documents --status
+
+# 运行知识健康检查
+sirchmunk compile --lint --work-path ~/.sirchmunk
+
+# 自动修复 lint 问题
+sirchmunk compile --lint --fix --work-path ~/.sirchmunk
+```
+
+> **注意**：此功能为 **Beta** 版本。编译产物会被搜索管线自动检测和使用，编译完成后无需额外配置。
 
 ---
 

@@ -244,6 +244,7 @@ class FileCompileResult:
     """Result of compiling a single file."""
 
     path: str
+    file_hash: str = ""
     tree: Optional[DocumentTree] = None
     summary: str = ""
     topics: List[str] = field(default_factory=list)
@@ -509,7 +510,7 @@ class KnowledgeCompiler:
                 if result.tree:
                     report.trees_built += 1
                 manifest.files[result.path] = FileManifestEntry(
-                    file_hash=get_fast_hash(result.path) or "",
+                    file_hash=result.file_hash,
                     compiled_at=datetime.now(timezone.utc).isoformat(),
                     has_tree=result.tree is not None,
                     cluster_ids=result.cluster_ids,
@@ -724,7 +725,7 @@ class KnowledgeCompiler:
         raw tables) are explicitly released after their last use to keep
         per-file peak memory bounded.
         """
-        result = FileCompileResult(path=entry.path)
+        result = FileCompileResult(path=entry.path, file_hash=entry.file_hash)
         try:
             await self._log.info(f"[Compile] Processing: {Path(entry.path).name}")
 
@@ -801,9 +802,8 @@ class KnowledgeCompiler:
                 try:
                     digest_dir = self._compile_dir / "xlsx_digests"
                     digest_dir.mkdir(parents=True, exist_ok=True)
-                    file_hash = get_fast_hash(entry.path) or ""
-                    if file_hash:
-                        (digest_dir / f"{file_hash}.txt").write_text(
+                    if result.file_hash:
+                        (digest_dir / f"{result.file_hash}.txt").write_text(
                             evidence_digest, encoding="utf-8",
                         )
                         result.has_xlsx_digest = True
@@ -813,11 +813,10 @@ class KnowledgeCompiler:
 
             # Cache ENHANCED content to disk
             try:
-                file_hash_content = get_fast_hash(entry.path) or ""
-                if file_hash_content and content:
+                if result.file_hash and content:
                     content_dir = self._compile_dir / "content"
                     content_dir.mkdir(parents=True, exist_ok=True)
-                    (content_dir / f"{file_hash_content}.txt").write_text(
+                    (content_dir / f"{result.file_hash}.txt").write_text(
                         content, encoding="utf-8",
                     )
             except Exception:
@@ -830,9 +829,8 @@ class KnowledgeCompiler:
                     if table_digest:
                         digest_dir = self._compile_dir / "table_digests"
                         digest_dir.mkdir(parents=True, exist_ok=True)
-                        file_hash = get_fast_hash(entry.path) or ""
-                        if file_hash:
-                            (digest_dir / f"{file_hash}.json").write_text(
+                        if result.file_hash:
+                            (digest_dir / f"{result.file_hash}.json").write_text(
                                 json.dumps(table_digest, ensure_ascii=False),
                                 encoding="utf-8",
                             )
@@ -1393,6 +1391,12 @@ class KnowledgeCompiler:
         Accepts lightweight ``(path, cluster_ids)`` pairs instead of full
         ``FileCompileResult`` objects to avoid retaining heavy compile results.
         Includes historical data from the manifest.
+
+        Uses an inverted-index approach: iterates over files (not cluster
+        pairs) to discover co-occurrences, then batch-loads all affected
+        clusters once before mutating edges in memory.  Final updates are
+        flushed in a single batch.  This avoids the O(N^2) cluster-pair
+        enumeration and per-pair async I/O of the naive approach.
         """
         cluster_to_files: Dict[str, Set[str]] = {}
 
@@ -1404,32 +1408,49 @@ class KnowledgeCompiler:
             for cid in entry.cluster_ids:
                 cluster_to_files.setdefault(cid, set()).add(fp)
 
-        # Find cluster pairs that share at least one source file
-        cluster_ids = list(cluster_to_files.keys())
+        # Build edge set via inverted index: iterate files, not cluster pairs.
+        # For each file, enumerate the (small) set of clusters it belongs to.
+        file_to_clusters: Dict[str, List[str]] = {}
+        for cid, files in cluster_to_files.items():
+            for fp in files:
+                file_to_clusters.setdefault(fp, []).append(cid)
+
+        edge_weights: Dict[Tuple[str, str], float] = {}
+        for cids in file_to_clusters.values():
+            for i in range(len(cids)):
+                for j in range(i + 1, len(cids)):
+                    pair = (min(cids[i], cids[j]), max(cids[i], cids[j]))
+                    edge_weights[pair] = edge_weights.get(pair, 0.0) + 0.25
+
+        if not edge_weights:
+            return 0
+
+        # Batch-load all affected clusters in one pass
+        affected_ids = {cid for pair in edge_weights for cid in pair}
+        cluster_cache: Dict[str, KnowledgeCluster] = {}
+        for cid in affected_ids:
+            obj = await self._storage.get(cid)
+            if obj is not None:
+                cluster_cache[cid] = obj
+
+        # Apply edges in memory
         edges_created = 0
-        pairs_seen: Set[Tuple[str, str]] = set()
+        dirty: Set[str] = set()
+        for (cid_a, cid_b), raw_weight in edge_weights.items():
+            weight = min(raw_weight, 1.0)
+            c_a = cluster_cache.get(cid_a)
+            c_b = cluster_cache.get(cid_b)
+            if c_a and c_b:
+                self._add_edge(c_a, cid_b, "co_occur", weight)
+                self._add_edge(c_b, cid_a, "co_occur", weight)
+                dirty.update((cid_a, cid_b))
+                edges_created += 1
 
-        for i in range(len(cluster_ids)):
-            for j in range(i + 1, len(cluster_ids)):
-                cid_a, cid_b = cluster_ids[i], cluster_ids[j]
-                shared = cluster_to_files[cid_a] & cluster_to_files[cid_b]
-                if not shared:
-                    continue
-
-                pair_key = (min(cid_a, cid_b), max(cid_a, cid_b))
-                if pair_key in pairs_seen:
-                    continue
-                pairs_seen.add(pair_key)
-
-                weight = min(len(shared) * 0.25, 1.0)
-                c_a = await self._storage.get(cid_a)
-                c_b = await self._storage.get(cid_b)
-                if c_a and c_b:
-                    self._add_edge(c_a, cid_b, "co_occur", weight)
-                    self._add_edge(c_b, cid_a, "co_occur", weight)
-                    await self._storage.update(c_a)
-                    await self._storage.update(c_b)
-                    edges_created += 1
+        # Batch-flush dirty clusters
+        for cid in dirty:
+            cluster = cluster_cache.get(cid)
+            if cluster:
+                await self._storage.update(cluster)
 
         return edges_created
 
