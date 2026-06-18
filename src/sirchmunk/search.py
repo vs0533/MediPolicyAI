@@ -1368,72 +1368,6 @@ class AgenticSearch(BaseSearch):
             )
         return True, []
 
-    async def _fill_evidence_gaps(
-        self,
-        query: str,
-        missing: List[str],
-        file_paths: List[str],
-        artifacts: Any,
-        *,
-        scope: Optional["_PathScope"] = None,
-        nav_cache: Optional[Dict[str, str]] = None,
-    ) -> Optional[str]:
-        """Targeted evidence retrieval for identified gaps.
-
-        Constructs focused sub-queries from *missing* descriptions and
-        re-navigates tree indices or falls back to keyword retrieval.
-
-        When *scope* is provided, extra files drawn from
-        ``artifacts.tree_available_paths`` are filtered to the scope.
-        When *nav_cache* is provided, navigation results are cached to
-        avoid duplicate LLM calls across phases.
-
-        Returns supplementary evidence text, or None.
-        """
-        sub_query = f"{query} — specifically: {'; '.join(missing)}"
-        parts: List[str] = []
-
-        async def _navigate(fp: str, q: str) -> Optional[str]:
-            if nav_cache is not None:
-                return await self._cached_navigate_tree(fp, q, nav_cache)
-            return await self._navigate_tree_for_evidence(fp, q)
-
-        indexer = self._get_tree_indexer()
-        for fp in file_paths[:3]:
-            try:
-                if indexer and indexer.has_tree(fp):
-                    ev = await _navigate(fp, sub_query)
-                    if ev and len(ev.strip()) > 100:
-                        parts.append(
-                            f"[Gap-fill: {Path(fp).name}]\n{ev}"
-                        )
-                        continue
-                ev = await self._tree_guided_sample(fp, sub_query)
-                if isinstance(ev, str) and len(ev.strip()) > 100:
-                    parts.append(f"[Gap-fill: {Path(fp).name}]\n{ev}")
-            except Exception:
-                continue
-
-        if not parts and artifacts and artifacts.tree_available_paths:
-            extra_fps = [
-                fp for fp in artifacts.tree_available_paths
-                if fp not in file_paths
-                and (not scope or scope.contains(fp))
-            ][:2]
-            for fp in extra_fps:
-                try:
-                    ev = await _navigate(fp, sub_query)
-                    if ev and len(ev.strip()) > 100:
-                        parts.append(
-                            f"[Gap-fill extra: {Path(fp).name}]\n{ev}"
-                        )
-                except Exception:
-                    continue
-
-        if not parts:
-            return None
-        return "\n\n".join(parts)
-
     # ------------------------------------------------------------------
     # Plan E: Computation verification
     # ------------------------------------------------------------------
@@ -2109,8 +2043,8 @@ class AgenticSearch(BaseSearch):
             self._probe_dir_scan(paths, enable_dir_scan),
             self._probe_knowledge_cache(query),
             self._load_spec_context(paths, stale_hours=spec_stale_hours),
-            self._probe_tree_index(query),
-            self._probe_compile_hints([query], scope=_scope),  # query-level hints; keyword-level runs post-Phase 1
+            self._probe_tree_index(query, scope=_scope),
+            self._probe_compile_hints([query], scope=_scope),
             self._probe_summary_index(query, artifacts, scope=_scope),    # GAP 2: zero-LLM BM25
             self._probe_catalog_for_deep(query, artifacts),  # GAP 4: zero-LLM keyword overlap
             return_exceptions=True,
@@ -2145,6 +2079,13 @@ class AgenticSearch(BaseSearch):
 
         # P3: inject extra keywords from structured knowledge probe
         for kw in knowledge_probe.extra_keywords:
+            if kw not in initial_keywords:
+                initial_keywords.append(kw)
+            if kw not in query_keywords:
+                query_keywords[kw] = 0.5
+
+        # P4: inject compile-hint extra keywords into Phase 2 keyword list
+        for kw in compile_hints.extra_keywords:
             if kw not in initial_keywords:
                 initial_keywords.append(kw)
             if kw not in query_keywords:
@@ -2265,7 +2206,25 @@ class AgenticSearch(BaseSearch):
         answer, should_save, cluster = await self._synthesize_from_retrieval(
             query, _query_intent, retrieval, merged_files,
             formula=data_reqs.formula,
+            background_context=spec_context,
         )
+
+        # ==============================================================
+        # Phase 4.6: Self-correction (conditional)
+        # ==============================================================
+        if answer == _NO_RESULTS_MESSAGE:
+            sc_retrieval = await self._deep_agentic_self_correct(
+                query, data_reqs, retrieval,
+                merged_files, target_files, context,
+            )
+            if sc_retrieval is not None:
+                answer, should_save, cluster = (
+                    await self._synthesize_from_retrieval(
+                        query, _query_intent, sc_retrieval, merged_files,
+                        formula=data_reqs.formula,
+                        background_context=spec_context,
+                    )
+                )
 
         # ==============================================================
         # Phase 4.75: Computation verification
@@ -2615,8 +2574,6 @@ class AgenticSearch(BaseSearch):
     """Whether to append rga evidence after tree sections as supplementary context."""
     _TREE_ROOT_HINTS_MAX_FILES = 10
     """Maximum number of tree roots to include in FAST Step 1 hints."""
-    _DEEP_PRE_NAV_MAX_FILES = 3
-    """Maximum number of tree files to pre-navigate in DEEP Phase 2.5."""
     _FAST_TREE_PROBE_MAX_FILES = 2
     """Maximum files returned by active tree probing in FAST mode."""
     _DEEP_TREE_PROBE_MAX_FILES = 3
@@ -2696,21 +2653,6 @@ class AgenticSearch(BaseSearch):
     # --- Self-correction expanded sampling ---
     _SELF_CORRECT_EXPANDED_NAV_RESULTS: int = 10
     """Expanded tree navigation leaf count for same-file re-sampling (default nav uses 5)."""
-    _SELF_CORRECT_EXPANDED_SECTIONS: int = 8
-    """Expanded tree sample sections for same-file re-sampling (default uses 5)."""
-
-    # --- Deep Structured Reasoning ---
-    _DEEP_SECTION_MAP_MAX_DEPTH: int = 3
-    """Maximum tree depth for section map construction (top-N layers)."""
-    _DEEP_MAX_EXTRACT_PAGES: int = 12
-    """Maximum pages to extract per file in targeted page extraction."""
-    _DEEP_STRUCTURED_MAX_CHARS: int = 30_000
-    """Maximum character budget for structured evidence per file."""
-    _DEEP_MAX_RECOVERY_ROUNDS: int = 3
-    """Maximum rounds of missing-data recovery before final answer."""
-    _DEEP_STRUCTURED_MAX_FILES: int = 3
-    """Maximum files to process through structured reasoning pipeline."""
-
     # --- Agentic retrieval ---
     _AGENTIC_MAX_ROUNDS: int = 3
     """Maximum retrieval rounds in the agentic loop."""
@@ -4597,69 +4539,6 @@ class AgenticSearch(BaseSearch):
             nav_cache[cache_key] = result
         return result
 
-    async def _collect_deep_tree_evidence(
-        self,
-        file_paths: List[str],
-        query: str,
-        *,
-        scope: Optional["_PathScope"] = None,
-        nav_cache: Optional[Dict[str, str]] = None,
-    ) -> Dict[str, str]:
-        """Full tree navigation for DEEP mode primary files.
-
-        Runs ``_navigate_tree_for_evidence`` (complement nav, table supplement,
-        referenced-page gap-fill) on each file.  Returns a dict mapping
-        file paths to raw evidence text.  The evidence is used to
-        **supplement** (not replace) Monte Carlo sampling.
-
-        When *scope* is provided, only files within the search path scope
-        are navigated — prevents cross-document evidence contamination.
-        When *nav_cache* is provided, results are cached to avoid
-        duplicate navigation across pipeline phases.
-        """
-        indexer = self._get_tree_indexer()
-        if indexer is None:
-            return {}
-
-        if scope:
-            file_paths = [fp for fp in file_paths if scope.contains(fp)]
-            if not file_paths:
-                return {}
-
-        nav_fps = [fp for fp in file_paths[:self._DEEP_PRE_NAV_MAX_FILES]
-                   if indexer.has_tree(fp)]
-        if not nav_fps:
-            return {}
-
-        if nav_cache is not None:
-            results = await asyncio.gather(
-                *[self._cached_navigate_tree(fp, query, nav_cache) for fp in nav_fps],
-                return_exceptions=True,
-            )
-        else:
-            results = await asyncio.gather(
-                *[self._navigate_tree_for_evidence(fp, query) for fp in nav_fps],
-                return_exceptions=True,
-            )
-
-        evidence_dict: Dict[str, str] = {}
-        for fp, res in zip(nav_fps, results):
-            if isinstance(res, Exception):
-                await self._logger.warning(
-                    f"[Phase 2.5:DirectTree] Navigation failed for "
-                    f"{Path(fp).name}: {res}"
-                )
-            elif isinstance(res, str) and res.strip():
-                evidence_dict[fp] = res
-
-        if evidence_dict:
-            total_len = sum(len(v) for v in evidence_dict.values())
-            await self._logger.info(
-                f"[Phase 2.5:DirectTree] {len(evidence_dict)} files, "
-                f"{total_len} chars"
-            )
-        return evidence_dict
-
     @classmethod
     def _classify_leaves(cls, leaves: list) -> Tuple[List[tuple], List, List]:
         """Classify leaf nodes by preferred extraction strategy.
@@ -5791,6 +5670,48 @@ class AgenticSearch(BaseSearch):
         )
         return evidence
 
+    async def _retrieve_similar_cluster_evidence(
+        self,
+        query: str,
+        *,
+        top_k: int = 2,
+        similarity_threshold: float = 0.50,
+        max_chars_per_cluster: int = 3000,
+        max_snippet_chars: int = 500,
+    ) -> Optional[str]:
+        """Retrieve evidence from semantically similar knowledge clusters.
+
+        Shared by both FAST and DEEP self-correction paths.  Returns
+        concatenated cluster content + snippet evidence, or ``None``
+        when no suitable clusters are found.
+        """
+        if not self.embedding_client or not self.knowledge_storage:
+            return None
+        try:
+            qe = self.embedding_client.encode(query)
+            if qe is None:
+                return None
+            vec = qe.tolist() if hasattr(qe, "tolist") else list(qe)
+            hits = await self.knowledge_storage.search_similar_clusters(
+                query_embedding=vec,
+                top_k=top_k,
+                similarity_threshold=similarity_threshold,
+            )
+            if not hits:
+                return None
+            parts: List[str] = []
+            for h in hits[:top_k]:
+                cluster = await self.knowledge_storage.get(h["id"])
+                if not cluster or not cluster.content:
+                    continue
+                parts.append(str(cluster.content)[:max_chars_per_cluster])
+                for ev in (cluster.evidences or [])[:3]:
+                    for s in (ev.snippets or [])[:2]:
+                        parts.append(s[:max_snippet_chars])
+            return "\n\n---\n\n".join(parts) if parts else None
+        except Exception:
+            return None
+
     async def _fast_self_correct(
         self,
         query: str,
@@ -5801,17 +5722,15 @@ class AgenticSearch(BaseSearch):
         """Attempt to gather alternative evidence when the first answer is rejected.
 
         Four strategies tried in order:
-        D) Re-sample the same primary file with expanded parameters (deeper sampling).
+        D) Re-sample the same primary file with expanded parameters.
         A) Tree-navigate a 2nd catalog-routed file not yet tried.
-        B) Retrieve the most semantically similar compiled cluster's content.
+        B) Retrieve semantically similar knowledge cluster evidence.
         C) Tree-navigate the 2nd-best rga file if available.
 
         Returns alternative evidence string, or None if all strategies fail.
         """
         first_file = best_files[0]["path"] if best_files else ""
 
-        # Strategy D: Re-sample the SAME primary file with expanded parameters.
-        # The file was correct but the initial sampling may have missed key sections.
         if first_file:
             expanded_tree_ev = await self._navigate_tree_for_evidence(
                 first_file, query,
@@ -5824,7 +5743,6 @@ class AgenticSearch(BaseSearch):
                 )
                 return expanded_tree_ev
 
-        # Strategy A: 2nd catalog-routed file via tree navigation
         for fp in catalog_routed_files:
             if fp == first_file:
                 continue
@@ -5833,30 +5751,10 @@ class AgenticSearch(BaseSearch):
                 context.mark_file_read(fp)
                 return tree_ev
 
-        # Strategy B: cluster content from knowledge storage
-        if self.embedding_client and self.knowledge_storage:
-            try:
-                qe = self.embedding_client.encode(query)
-                if qe is not None:
-                    vec = qe.tolist() if hasattr(qe, "tolist") else list(qe)
-                    hits = await self.knowledge_storage.search_similar_clusters(
-                        query_embedding=vec, top_k=2, similarity_threshold=0.50,
-                    )
-                    if hits:
-                        parts: List[str] = []
-                        for h in hits[:2]:
-                            c = await self.knowledge_storage.get(h["id"])
-                            if c and c.content:
-                                parts.append(str(c.content)[:3000])
-                                for ev in (c.evidences or [])[:3]:
-                                    for s in (ev.snippets or [])[:2]:
-                                        parts.append(s[:500])
-                        if parts:
-                            return "\n\n---\n\n".join(parts)
-            except Exception:
-                pass
+        cluster_ev = await self._retrieve_similar_cluster_evidence(query)
+        if cluster_ev:
+            return cluster_ev
 
-        # Strategy C: 2nd rga file via tree navigation
         if best_files and len(best_files) > 1:
             fp2 = best_files[1]["path"]
             tree_ev = await self._navigate_tree_for_evidence(fp2, query)
@@ -5864,6 +5762,130 @@ class AgenticSearch(BaseSearch):
                 context.mark_file_read(fp2)
                 return tree_ev
 
+        return None
+
+    async def _deep_agentic_self_correct(
+        self,
+        query: str,
+        data_reqs: "DataRequirements",
+        initial_retrieval: "RetrievalResult",
+        merged_files: List[str],
+        target_files: List[str],
+        context: "SearchContext",
+    ) -> Optional["RetrievalResult"]:
+        """Recover evidence when DEEP synthesis is rejected.
+
+        Strategies (tried in order, first success short-circuits):
+
+        S1 — Expand candidate files: run agentic retrieval on files
+             ranked below the initial ``target_files`` cut-off.
+        S2 — Broaden page extraction on the same target files by
+             re-running page selection with already-fetched pages
+             excluded and doubled budget.
+        S3 — Pull evidence from semantically similar knowledge
+             clusters (shared with FAST via
+             ``_retrieve_similar_cluster_evidence``).
+        S4 — Tree-navigated evidence on tree-indexed files from the
+             broader merged list (compile-dependent; skipped when no
+             tree cache exists).
+        """
+        _min_evidence_len = 100
+
+        # S1: try next-ranked files not in the initial target set
+        target_set = set(target_files)
+        extra_files = [fp for fp in merged_files if fp not in target_set]
+        if extra_files:
+            extra_targets = extra_files[: self._AGENTIC_MAX_FILES]
+            await self._logger.info(
+                f"[DEEP:SelfCorrect] S1: expanding to {len(extra_targets)} "
+                f"additional files"
+            )
+            alt_retrieval = await self._agentic_retrieve(
+                query, data_reqs, extra_targets, context,
+            )
+            if len(alt_retrieval.evidence.strip()) >= _min_evidence_len:
+                await self._logger.info(
+                    "[DEEP:SelfCorrect] S1 succeeded: alternative files"
+                )
+                return alt_retrieval
+
+        # S2: broader page extraction on original targets
+        already_fetched = initial_retrieval.pages_extracted
+        if any(already_fetched.values()):
+            await self._logger.info("[DEEP:SelfCorrect] S2: expanding pages")
+            broader_reqs = DataRequirements(
+                data_points=data_reqs.data_points,
+                likely_sources=data_reqs.likely_sources,
+                formula=data_reqs.formula,
+                time_period=data_reqs.time_period,
+                intent=data_reqs.intent,
+            )
+            broader = await self._agentic_retrieve(
+                query, broader_reqs, target_files, context,
+            )
+            combined_ev = (
+                initial_retrieval.evidence + "\n\n" + broader.evidence
+            ).strip()
+            if len(combined_ev) > len(initial_retrieval.evidence) + _min_evidence_len:
+                await self._logger.info(
+                    "[DEEP:SelfCorrect] S2 succeeded: broadened pages"
+                )
+                merged_pages: Dict[str, list] = {}
+                for src in (initial_retrieval, broader):
+                    for fp, pages in src.pages_extracted.items():
+                        merged_pages.setdefault(fp, [])
+                        merged_pages[fp] = sorted(
+                            set(merged_pages[fp]) | set(pages)
+                        )
+                return RetrievalResult(
+                    evidence=combined_ev[: self._AGENTIC_EVIDENCE_MAX_CHARS],
+                    pages_extracted=merged_pages,
+                    is_complete=broader.is_complete,
+                    rounds_used=(
+                        initial_retrieval.rounds_used + broader.rounds_used
+                    ),
+                )
+
+        # S3: knowledge-cluster semantic retrieval
+        await self._logger.info("[DEEP:SelfCorrect] S3: knowledge clusters")
+        cluster_ev = await self._retrieve_similar_cluster_evidence(query)
+        if cluster_ev and len(cluster_ev.strip()) >= _min_evidence_len:
+            await self._logger.info(
+                "[DEEP:SelfCorrect] S3 succeeded: knowledge cluster"
+            )
+            return RetrievalResult(
+                evidence=cluster_ev[: self._AGENTIC_EVIDENCE_MAX_CHARS],
+                pages_extracted={},
+                is_complete=False,
+                rounds_used=0,
+            )
+
+        # S4: tree navigation on broader file set
+        indexer = self._get_tree_indexer()
+        if indexer is not None:
+            tree_candidates = [
+                fp for fp in merged_files
+                if fp not in target_set and indexer.has_tree(fp)
+            ]
+            for fp in tree_candidates[:2]:
+                await self._logger.info(
+                    f"[DEEP:SelfCorrect] S4: tree nav on {Path(fp).name}"
+                )
+                tree_ev = await self._navigate_tree_for_evidence(fp, query)
+                if tree_ev and len(tree_ev.strip()) >= _min_evidence_len:
+                    await self._logger.info(
+                        "[DEEP:SelfCorrect] S4 succeeded: tree navigation"
+                    )
+                    return RetrievalResult(
+                        evidence=tree_ev[: self._AGENTIC_EVIDENCE_MAX_CHARS],
+                        pages_extracted={},
+                        is_complete=False,
+                        rounds_used=0,
+                    )
+
+        await self._logger.info(
+            "[DEEP:SelfCorrect] All strategies exhausted"
+        )
         return None
 
     @staticmethod
@@ -6306,17 +6328,27 @@ class AgenticSearch(BaseSearch):
             if Path(pool[idx].file_path).exists()
         ]
 
-    async def _probe_tree_index(self, query: str) -> List[str]:
+    async def _probe_tree_index(
+        self,
+        query: str,
+        *,
+        scope: Optional["_PathScope"] = None,
+    ) -> List[str]:
         """LLM-driven file discovery via compiled tree root summaries (PageIndex).
 
         Loads all cached document trees, presents their root summaries to the
-        LLM, and asks it to select the most relevant documents.  Returns file
-        paths of the most relevant documents.
+        LLM, and asks it to select the most relevant documents.  When *scope*
+        is provided, trees outside the search path are filtered out before
+        LLM selection to prevent cross-project contamination.
         """
         try:
             trees = self._load_cached_trees()
             if not trees:
                 return []
+            if scope:
+                trees = {fp: t for fp, t in trees.items() if scope.contains(fp)}
+                if not trees:
+                    return []
             result = await self._llm_select_from_trees(
                 query, trees, max_select=self._DEEP_TREE_PROBE_MAX_FILES,
             )
@@ -6731,95 +6763,6 @@ class AgenticSearch(BaseSearch):
             log_callback=_cb,
         )
 
-    async def _build_cluster(
-        self,
-        query: str,
-        file_paths: List[str],
-        query_keywords: Dict[str, float],
-        top_k_files: int = 5,
-        top_k_snippets: int = 5,
-    ) -> Optional[KnowledgeCluster]:
-        """Build a KnowledgeCluster via knowledge_base.build().
-
-        Constructs the Request wrapper and delegates to the knowledge
-        base for parallel Monte Carlo evidence sampling.  When compiled
-        tree indices exist, passes a ``tree_indexer`` so that evidence
-        extraction can navigate to relevant sections before sampling.
-        """
-        try:
-            request = Request(
-                messages=[
-                    Message(
-                        role="user",
-                        content=[ContentItem(type="text", text=query)],
-                    ),
-                ],
-            )
-            retrieved_infos = [{"path": fp} for fp in file_paths]
-
-            cluster = await self.knowledge_base.build(
-                request=request,
-                retrieved_infos=retrieved_infos,
-                keywords=query_keywords,
-                top_k_files=top_k_files,
-                top_k_snippets=top_k_snippets,
-                verbose=self.verbose,
-                tree_indexer=self._get_tree_indexer(),
-            )
-            self.llm_usages.extend(self.knowledge_base.llm_usages)
-            self.knowledge_base.llm_usages.clear()
-
-            if cluster:
-                await self._logger.success(
-                    f"[Phase 3] KnowledgeCluster built: {cluster.name} "
-                    f"({len(cluster.evidences)} evidence units)"
-                )
-            return cluster
-        except Exception as exc:
-            await self._logger.warning(f"[Phase 3] knowledge_base.build() failed: {exc}")
-            return None
-
-    async def _gather_graph_context(self, cluster: KnowledgeCluster) -> str:
-        """Enrich answer context with knowledge from graph neighbours.
-
-        Traverses the cluster's ``related_clusters`` edges (sorted by weight),
-        fetches the top neighbours, and returns a joined summary string that
-        can be appended to the cluster content before answer generation.
-        """
-        edges = sorted(
-            getattr(cluster, "related_clusters", []) or [],
-            key=lambda e: getattr(e, "weight", 0),
-            reverse=True,
-        )
-        if not edges:
-            return ""
-
-        parts: List[str] = []
-        for edge in edges[:3]:
-            tid = getattr(edge, "target_cluster_id", None)
-            if not tid:
-                continue
-            try:
-                neighbour = await self.knowledge_storage.get(tid)
-            except Exception:
-                continue
-            if not neighbour:
-                continue
-            content = neighbour.content
-            if isinstance(content, list):
-                content = "\n".join(content)
-            name = getattr(neighbour, "name", "") or ""
-            snippet = str(content or "")[:300]
-            if snippet:
-                parts.append(f"- {name}: {snippet}")
-
-        if not parts:
-            return ""
-        await self._logger.info(
-            f"[Phase 3.5] Graph context: {len(parts)} neighbour summaries"
-        )
-        return "Related knowledge:\n" + "\n".join(parts)
-
     # ------------------------------------------------------------------
     # Phase 4: Answer generation
     # ------------------------------------------------------------------
@@ -6853,61 +6796,6 @@ class AgenticSearch(BaseSearch):
                 f"{prompt}\n\n### Document Context\n{document_context}"
             )
         return prompt
-
-    async def _summarise_cluster(
-        self, query: str, cluster: KnowledgeCluster,
-        intent: str = "",
-    ) -> Tuple[str, bool, bool]:
-        """Generate a final answer summary from a KnowledgeCluster.
-
-        When *intent* is provided, selects a specialised synthesis prompt
-        (lookup / computation / comparison).  Falls back to the general
-        ``ROI_RESULT_SUMMARY`` for FAST mode or unknown intents.
-
-        Returns:
-            ``(summary_text, should_save, should_answer)`` where:
-            - should_save: quality verdict for persistence
-            - should_answer: evidence sufficiency verdict for answering
-        """
-        sep = "\n"
-        cluster_text_content = (
-            f"{cluster.name}\n\n"
-            f"{sep.join(cluster.description)}\n\n"
-            f"{cluster.content if isinstance(cluster.content, str) else sep.join(cluster.content)}"
-        )
-
-        result_sum_prompt = self._select_synthesis_prompt(
-            query, cluster_text_content, intent,
-        )
-
-        await self._logger.info("[Phase 4] Generating search result summary...")
-        response = await self.llm.achat(
-            messages=[{"role": "user", "content": result_sum_prompt}],
-            stream=True,
-        )
-        self.llm_usages.append(response.usage)
-
-        summary, should_save, should_answer = self._parse_summary_response(response.content)
-        return summary, should_save, should_answer
-
-    async def _summarise_cluster_fallback(self, query: str) -> Tuple[str, bool]:
-        """Generate an answer using the ROI summary prompt with fallback evidence.
-
-        Feeds the standard fallback text so the LLM answers from its own
-        knowledge without adding an extra LLM call to the pipeline.
-        """
-        result_sum_prompt = ROI_RESULT_SUMMARY.format(
-            user_input=query,
-            text_content=self._LLM_FALLBACK_EVIDENCE,
-        )
-        await self._logger.info("[Phase 4] Generating fallback summary from LLM knowledge...")
-        response = await self.llm.achat(
-            messages=[{"role": "user", "content": result_sum_prompt}],
-            stream=True,
-        )
-        self.llm_usages.append(response.usage)
-        summary, _, _ = self._parse_summary_response(response.content)
-        return summary, False  # Never save fallback answers
 
     async def _summarise_fast_fallback(
         self, query: str, context: "SearchContext",
@@ -7430,6 +7318,7 @@ class AgenticSearch(BaseSearch):
         retrieval: RetrievalResult,
         file_paths: List[str],
         formula: Optional[str] = None,
+        background_context: str = "",
     ) -> Tuple[str, bool, Optional["KnowledgeCluster"]]:
         """Synthesize final answer from agentic retrieval evidence."""
         if not retrieval.evidence.strip():
@@ -7439,9 +7328,12 @@ class AgenticSearch(BaseSearch):
         if formula and intent == "computation":
             evidence = f"[Required Formula: {formula}]\n\n{evidence}"
 
-        # ── Stage 1: Structured data extraction (computation/comparison) ──
-        # For intents that require precise numeric reasoning, first extract
-        # structured data points to reduce ambiguity for the synthesis LLM.
+        if background_context:
+            evidence = (
+                f"[Background Context]\n"
+                f"{background_context[:2000]}\n\n{evidence}"
+            )
+
         if intent in self._TWO_STAGE_INTENTS:
             focused = await self._focus_evidence(query, evidence)
             if focused:
@@ -7714,487 +7606,6 @@ class AgenticSearch(BaseSearch):
             map_lines.append(f"[{sec['idx']}] {indent}{sec['title']} {page_str}")
 
         return "\n".join(map_lines), sections
-
-    async def _select_evidence_sections(
-        self,
-        query: str,
-        section_map: str,
-        sections_meta: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        """LLM-driven selection of relevant sections from a section map.
-
-        Returns the metadata dicts for the selected sections.
-        """
-        prompt = DEEP_SECTION_SELECT.format(
-            query=query,
-            section_map=section_map,
-        )
-        resp = await self.llm.achat(
-            messages=[{"role": "user", "content": prompt}],
-            stream=False,
-        )
-        self.llm_usages.append(resp.usage)
-
-        raw = (resp.content or "").strip()
-        # Parse JSON array of indices
-        try:
-            match = re.search(r"\[[\s\d,]*\]", raw)
-            if match:
-                indices = json.loads(match.group(0))
-                return [
-                    sections_meta[i]
-                    for i in indices
-                    if isinstance(i, int) and 0 <= i < len(sections_meta)
-                ]
-        except (json.JSONDecodeError, IndexError):
-            pass
-
-        # Fallback: return sections that have page_range data
-        return [s for s in sections_meta if s.get("page_range")][:3]
-
-    async def _extract_targeted_pages(
-        self,
-        file_path: str,
-        selected_sections: List[Dict[str, Any]],
-        query: str,
-    ) -> str:
-        """Extract content for LLM-selected sections.
-
-        Two extraction strategies (tried in order):
-          1. **Page-based** — ``DocumentExtractor.extract_pages`` for PDFs.
-          2. **Char-range** — direct text slice from compile cache or
-             fast_extract for any file type.
-
-        Table digests are appended when available.  Caps output at
-        ``_DEEP_STRUCTURED_MAX_CHARS``.
-        """
-        parts: List[str] = []
-
-        # Strategy 1: page-based extraction (PDF)
-        pages_needed: Set[int] = set()
-        for sec in selected_sections:
-            pr = sec.get("page_range")
-            if pr and len(pr) == 2 and pr[0]:
-                pages_needed.update(range(
-                    max(1, pr[0] - self._NAV_PAGE_MARGIN),
-                    pr[1] + self._NAV_PAGE_MARGIN + 1,
-                ))
-
-        if pages_needed:
-            sorted_pages = sorted(pages_needed)[: self._DEEP_MAX_EXTRACT_PAGES]
-            try:
-                page_contents = DocumentExtractor.extract_pages(
-                    file_path, sorted_pages,
-                )
-                for pc in page_contents:
-                    if pc.content and pc.content.strip():
-                        parts.append(f"[Page {pc.page_number}]\n{pc.content}")
-            except Exception as e:
-                await self._logger.warning(
-                    f"[DeepStructured] Page extraction failed for "
-                    f"{Path(file_path).name}: {e}"
-                )
-
-        # Strategy 2: char_range fallback (non-PDF or when pages failed)
-        if not parts:
-            full_text = self._load_compile_content(self.work_path, file_path)
-            if not full_text:
-                try:
-                    from sirchmunk.utils.file_utils import fast_extract
-                    extraction = await fast_extract(file_path=file_path)
-                    full_text = extraction.content or ""
-                except Exception:
-                    full_text = ""
-            if full_text:
-                for sec in selected_sections:
-                    cr = sec.get("char_range")
-                    if cr and len(cr) == 2 and cr[0] is not None:
-                        start, end = cr
-                        if 0 <= start < end <= len(full_text):
-                            segment = full_text[start:end]
-                            if segment.strip():
-                                parts.append(
-                                    f"[{sec.get('title', 'Section')}]\n{segment}"
-                                )
-
-        # Append relevant table digests when available
-        if pages_needed:
-            try:
-                from sirchmunk.utils.file_utils import get_fast_hash
-                fhash = get_fast_hash(file_path)
-                if fhash:
-                    tables = self._load_table_digest(self.work_path, fhash)
-                    if tables:
-                        page_tables = [
-                            t for t in tables
-                            if t.get("page_number") in pages_needed
-                        ]
-                        if page_tables:
-                            table_ev = self._format_table_evidence(
-                                page_tables,
-                                max_chars=self._TABLE_EVIDENCE_DEFAULT_CHARS,
-                                query=query,
-                            )
-                            if table_ev:
-                                parts.append(f"[Table Evidence]\n{table_ev}")
-            except Exception:
-                pass
-
-        evidence = "\n\n".join(parts)
-        return evidence[: self._DEEP_STRUCTURED_MAX_CHARS]
-
-    async def _deep_structured_reasoning(
-        self,
-        query: str,
-        tree_files: List[str],
-        artifacts: Any,
-        context: "SearchContext",
-        intent: str = "",
-    ) -> Tuple[str, Optional["KnowledgeCluster"], str]:
-        """Orchestrate the Deep Structured Reasoning pipeline.
-
-        Phases:
-          1. Section map  — build from tree index top layers (no LLM)
-          2. Section select — LLM picks relevant sections (1 LLM)
-          3. Targeted extraction — pull pages + tables for sections (no LLM)
-          4. Synthesis — intent-aware prompt on targeted evidence (1 LLM)
-          5. Recovery — if refused, expand sections and re-synthesize
-
-        Returns ``(raw_llm_output, cluster, combined_evidence)`` where
-        *combined_evidence* is the raw document text fed to the LLM so
-        callers can use it for evidence-acceptance checks instead of
-        the LLM's answer text.
-        """
-        indexer = self._get_tree_indexer()
-        if indexer is None:
-            return "", None, ""
-
-        all_evidence_parts: List[str] = []
-
-        for fp in tree_files[: self._DEEP_STRUCTURED_MAX_FILES]:
-            fname = Path(fp).name
-            tree = indexer.load_tree(fp)
-            if tree is None or tree.root is None:
-                continue
-
-            section_map, sections_meta = self._build_section_map(
-                tree.root, max_depth=self._DEEP_SECTION_MAP_MAX_DEPTH,
-            )
-            if not sections_meta:
-                continue
-
-            await self._logger.info(
-                f"[DeepSR] Section map for {fname}: "
-                f"{len(sections_meta)} sections"
-            )
-
-            selected = await self._select_evidence_sections(
-                query, section_map, sections_meta,
-            )
-            context.increment_loop()
-            if not selected:
-                continue
-
-            await self._logger.info(
-                f"[DeepSR] Selected {len(selected)} sections: "
-                f"{[s['title'][:30] for s in selected]}"
-            )
-
-            raw_evidence = await self._extract_targeted_pages(
-                fp, selected, query,
-            )
-            if not raw_evidence:
-                continue
-
-            await self._logger.info(
-                f"[DeepSR] Extracted {len(raw_evidence)} chars from {fname}"
-            )
-
-            all_evidence_parts.append(f"[Source: {fname}]\n{raw_evidence}")
-
-        if not all_evidence_parts:
-            return "", None, ""
-
-        combined_evidence = "\n\n---\n\n".join(all_evidence_parts)
-
-        # Build document context from artifacts when available
-        doc_context: Optional[str] = None
-        if artifacts and artifacts.catalog_map:
-            ctx_parts = [
-                self._build_answer_context(fp, artifacts)
-                for fp in tree_files[: self._DEEP_STRUCTURED_MAX_FILES]
-            ]
-            ctx_parts = [c for c in ctx_parts if c]
-            if ctx_parts:
-                doc_context = "\n".join(ctx_parts)
-
-        # Synthesize answer using intent-aware prompt
-        synth_prompt = self._select_synthesis_prompt(
-            query, combined_evidence, intent,
-            document_context=doc_context,
-        )
-
-        resp = await self.llm.achat(
-            messages=[{"role": "user", "content": synth_prompt}],
-            stream=True,
-        )
-        self.llm_usages.append(resp.usage)
-        context.increment_loop()
-
-        raw_response = resp.content or ""
-        _, _, should_answer = self._parse_summary_response(raw_response)
-
-        await self._logger.info(
-            f"[DeepSR] Synthesis complete: should_answer={should_answer}, "
-            f"len={len(raw_response)}"
-        )
-
-        # Recovery: if the answer is a refusal, try expanding sections
-        if (not should_answer or self._is_refusal_answer(raw_response[:500])):
-            for recovery_round in range(1, self._DEEP_MAX_RECOVERY_ROUNDS + 1):
-                await self._logger.info(
-                    f"[DeepSR] Recovery round {recovery_round}"
-                )
-                expanded_parts: List[str] = list(all_evidence_parts)
-                found_new = False
-                for fp in tree_files[: self._DEEP_STRUCTURED_MAX_FILES]:
-                    tree = indexer.load_tree(fp)
-                    if tree is None or tree.root is None:
-                        continue
-                    section_map, sections_meta = self._build_section_map(
-                        tree.root,
-                        max_depth=self._DEEP_SECTION_MAP_MAX_DEPTH + recovery_round,
-                    )
-                    if not sections_meta:
-                        continue
-                    recovery_selected = await self._select_evidence_sections(
-                        query, section_map, sections_meta,
-                    )
-                    context.increment_loop()
-                    if not recovery_selected:
-                        continue
-                    recovery_ev = await self._extract_targeted_pages(
-                        fp, recovery_selected, query,
-                    )
-                    if recovery_ev and recovery_ev not in combined_evidence:
-                        expanded_parts.append(
-                            f"[Recovery source: {Path(fp).name}]\n{recovery_ev}"
-                        )
-                        found_new = True
-                if not found_new:
-                    break
-                combined_evidence = "\n\n---\n\n".join(expanded_parts)
-                synth_prompt = self._select_synthesis_prompt(
-                    query,
-                    combined_evidence[:self._DEEP_STRUCTURED_MAX_CHARS],
-                    intent,
-                    document_context=doc_context,
-                )
-                resp = await self.llm.achat(
-                    messages=[{"role": "user", "content": synth_prompt}],
-                    stream=True,
-                )
-                self.llm_usages.append(resp.usage)
-                context.increment_loop()
-                raw_response = resp.content or ""
-                _, _, should_answer = self._parse_summary_response(raw_response)
-                if should_answer and not self._is_refusal_answer(
-                    raw_response[:500]
-                ):
-                    break
-
-        cluster = self._make_answer_cluster(
-            query, combined_evidence[:5000], "DSR",
-            file_paths=tree_files[: self._DEEP_STRUCTURED_MAX_FILES],
-        )
-
-        return raw_response, cluster, combined_evidence
-
-    async def _deep_self_correct(
-        self,
-        query: str,
-        merged_files: List[str],
-        query_keywords: Dict[str, float],
-        context: "SearchContext",
-    ) -> Optional[str]:
-        """Gather alternative evidence when DEEP Phase 4 answer is rejected.
-
-        Four strategies tried in order, stopping at first success:
-          A) Expanded tree-guided sampling on the primary file.
-          B) rga keyword window extraction on primary files using
-             Phase-1 keywords (reuses the rga infrastructure).
-          C) Semantically similar cluster from knowledge storage.
-          D) Tree-guided sampling on secondary merged files.
-
-        Returns alternative evidence text, or ``None`` when every
-        strategy fails.
-        """
-        primary_files = merged_files[:2]
-        secondary_files = merged_files[2:5]
-
-        # Strategy A: expanded tree sampling on primary file
-        for fp in primary_files:
-            expanded_ev = await self._tree_guided_sample(
-                fp, query,
-                max_chars=self._FAST_MAX_EVIDENCE_CHARS * 2,
-            )
-            if isinstance(expanded_ev, str) and len(expanded_ev.strip()) > 100:
-                await self._logger.info(
-                    "[DEEP:SelfCorrect] Strategy A succeeded: "
-                    f"expanded tree sample from {Path(fp).name}"
-                )
-                return expanded_ev
-
-        # Strategy B: tree-navigated evidence with expanded parameters
-        for fp in primary_files:
-            try:
-                nav_ev = await self._navigate_tree_for_evidence(
-                    fp, query,
-                    max_results=self._SELF_CORRECT_EXPANDED_NAV_RESULTS,
-                )
-                if nav_ev and len(nav_ev.strip()) > 100:
-                    await self._logger.info(
-                        "[DEEP:SelfCorrect] Strategy B succeeded: "
-                        f"expanded tree navigation on {Path(fp).name}"
-                    )
-                    return nav_ev
-            except Exception:
-                pass
-
-        # Strategy C: semantically similar cluster from knowledge storage
-        if self.embedding_client and self.knowledge_storage:
-            try:
-                qe = self.embedding_client.encode(query)
-                if qe is not None:
-                    vec = qe.tolist() if hasattr(qe, "tolist") else list(qe)
-                    hits = await self.knowledge_storage.search_similar_clusters(
-                        query_embedding=vec, top_k=2, similarity_threshold=0.50,
-                    )
-                    if hits:
-                        parts: List[str] = []
-                        for h in hits[:2]:
-                            c = await self.knowledge_storage.get(h["id"])
-                            if c and c.content:
-                                parts.append(str(c.content)[:3000])
-                                for ev in (c.evidences or [])[:3]:
-                                    for s in (ev.snippets or [])[:2]:
-                                        parts.append(s[:500])
-                        if parts:
-                            await self._logger.info(
-                                "[DEEP:SelfCorrect] Strategy C succeeded: "
-                                "knowledge storage cluster"
-                            )
-                            return "\n\n---\n\n".join(parts)
-            except Exception:
-                pass
-
-        # Strategy D: tree sampling on secondary files
-        for fp in secondary_files:
-            tree_ev = await self._tree_guided_sample(
-                fp, query,
-                max_chars=self._FAST_MAX_EVIDENCE_CHARS,
-            )
-            if isinstance(tree_ev, str) and len(tree_ev.strip()) > 100:
-                context.mark_file_read(fp)
-                await self._logger.info(
-                    "[DEEP:SelfCorrect] Strategy D succeeded: "
-                    f"secondary file {Path(fp).name}"
-                )
-                return tree_ev
-
-        await self._logger.info("[DEEP:SelfCorrect] All strategies exhausted")
-        return None
-
-    async def _react_refinement(
-        self,
-        query: str,
-        paths: List[str],
-        initial_keywords: List[str],
-        spec_context: str,
-        enable_dir_scan: bool,
-        max_loops: int,
-        max_token_budget: int,
-        max_depth: Optional[int] = 5,
-        include: Optional[List[str]] = None,
-        exclude: Optional[List[str]] = None,
-    ) -> Tuple[str, SearchContext]:
-        """Fall back to ReAct loop when parallel probing yields insufficient evidence.
-
-        The ReAct agent receives pre-extracted keywords and cached
-        directory context so it doesn't waste turns re-discovering them.
-        """
-        from sirchmunk.agentic.react_agent import ReActSearchAgent
-
-        registry = self._ensure_tool_registry(
-            paths, enable_dir_scan,
-            max_depth=max_depth,
-            include=include,
-            exclude=exclude,
-        )
-        agent = ReActSearchAgent(
-            llm=self.llm,
-            tool_registry=registry,
-            max_loops=max_loops,
-            max_token_budget=max_token_budget,
-        )
-
-        augmented_query = query
-        if spec_context:
-            augmented_query = (
-                f"{query}\n\n"
-                f"[System hint — cached directory context]\n{spec_context}"
-            )
-
-        answer, context = await agent.run(
-            query=augmented_query,
-            initial_keywords=initial_keywords or None,
-        )
-        return answer, context
-
-    async def _build_cluster_from_context(
-        self,
-        query: str,
-        answer: str,
-        context: SearchContext,
-        query_keywords: Dict[str, float],
-        top_k_files: int = 5,
-    ) -> Optional[KnowledgeCluster]:
-        """Build a KnowledgeCluster from files discovered during a ReAct session.
-
-        Collects file paths from ``context.read_file_ids`` and retrieval
-        logs, then delegates to ``_build_cluster()``.  Falls back to a
-        lightweight answer-only cluster when no files were discovered.
-        """
-        if not answer or len(answer) < 50:
-            return None
-
-        # Collect all discovered file paths
-        discovered: List[str] = list(context.read_file_ids)
-        for log_entry in context.retrieval_logs:
-            if log_entry.tool_name == "keyword_search":
-                for p in log_entry.metadata.get("files_discovered", []):
-                    if p not in discovered:
-                        discovered.append(p)
-
-        if discovered:
-            cluster = await self._build_cluster(
-                query=query,
-                file_paths=discovered,
-                query_keywords=query_keywords,
-                top_k_files=top_k_files,
-            )
-            if cluster:
-                if not cluster.search_results:
-                    cluster.search_results = list(discovered)
-                return cluster
-
-        # Fallback: lightweight cluster from answer text
-        try:
-            return self._make_answer_cluster(
-                query, answer, prefix="R", file_paths=discovered,
-            )
-        except Exception:
-            return None
 
     # ------------------------------------------------------------------
     # Spec-path caching  (Task 4)
