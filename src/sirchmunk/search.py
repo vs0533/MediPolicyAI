@@ -2654,6 +2654,8 @@ class AgenticSearch(BaseSearch):
     _SELF_CORRECT_EXPANDED_NAV_RESULTS: int = 10
     """Expanded tree navigation leaf count for same-file re-sampling (default nav uses 5)."""
     # --- Agentic retrieval ---
+    _PAGINATED_EXTENSIONS: frozenset = frozenset({".pdf"})
+    """File extensions that support page-based extraction via ``extract_pages``."""
     _AGENTIC_MAX_ROUNDS: int = 3
     """Maximum retrieval rounds in the agentic loop."""
     _AGENTIC_MAX_PAGES_PER_ROUND: int = 8
@@ -7001,6 +7003,53 @@ class AgenticSearch(BaseSearch):
             )
         return True, []
 
+    async def _extract_non_paginated_content(
+        self,
+        file_path: str,
+        query: str,
+        *,
+        max_chars: int = 0,
+    ) -> Optional[str]:
+        """Extract content from a non-paginated file (text, markdown, etc.).
+
+        Uses two strategies in order:
+
+        1. **Small file direct read** — for text-family files below
+           ``_FAST_SMALL_FILE_THRESHOLD``, reads the entire file.
+        2. **Kreuzberg extraction** — for any file type, delegates to
+           ``DocumentExtractor.extract`` which handles all formats via
+           kreuzberg (docx, html, xlsx, etc.).
+
+        Returns the extracted text (capped to *max_chars*), or ``None``
+        on failure.
+        """
+        budget = max_chars or self._AGENTIC_EVIDENCE_MAX_CHARS
+        fname = Path(file_path).name
+        ext = Path(file_path).suffix.lower()
+
+        # Strategy 1: direct read for text-family files
+        if ext in self._FAST_TEXT_EXTENSIONS:
+            try:
+                sz = Path(file_path).stat().st_size
+                if sz <= self._FAST_SMALL_FILE_THRESHOLD:
+                    text = Path(file_path).read_text(errors="replace")
+                    if text.strip():
+                        return f"[{fname}]\n{text}"[:budget]
+            except Exception:
+                pass
+
+        # Strategy 2: kreuzberg-based extraction (docx, xlsx, html, etc.)
+        try:
+            from sirchmunk.utils.file_utils import fast_extract
+            extraction = await fast_extract(file_path=file_path)
+            content = extraction.content or ""
+            if content.strip():
+                return f"[{fname}]\n{content}"[:budget]
+        except Exception:
+            pass
+
+        return None
+
     async def _agentic_retrieve(
         self,
         query: str,
@@ -7019,16 +7068,26 @@ class AgenticSearch(BaseSearch):
         file_total_pages: Dict[str, int] = {}
         outline_target_files: List[str] = []
 
+        non_paginated_files: List[str] = []
+
         for fp in target_files:
+            ext = Path(fp).suffix.lower()
+            is_paginated = ext in self._PAGINATED_EXTENSIONS
+
             tree = indexer.load_tree(fp) if indexer else None
             if tree and tree.total_pages:
                 file_total_pages[fp] = tree.total_pages
-            if fp not in file_total_pages:
+                is_paginated = True
+            elif is_paginated and fp not in file_total_pages:
                 try:
                     from pypdf import PdfReader
                     file_total_pages[fp] = len(PdfReader(fp).pages)
                 except Exception:
                     pass
+
+            if not is_paginated and fp not in file_total_pages:
+                non_paginated_files.append(fp)
+                continue
 
             tp = file_total_pages.get(fp)
             if tp and tp <= self._SHORT_DOC_THRESHOLD:
@@ -7050,6 +7109,20 @@ class AgenticSearch(BaseSearch):
                     outline_target_files.append(fp)
                 continue
             outline_target_files.append(fp)
+
+        # Direct extraction for non-paginated files (txt, md, docx, etc.)
+        for fp in non_paginated_files:
+            remaining = self._AGENTIC_EVIDENCE_MAX_CHARS - sum(
+                len(p) for p in evidence_parts
+            )
+            if remaining <= 0:
+                break
+            content = await self._extract_non_paginated_content(
+                fp, query, max_chars=remaining,
+            )
+            if content:
+                evidence_parts.append(content)
+                pages_extracted[fp] = set()
 
         for fp in outline_target_files:
             tp = file_total_pages.get(fp)
@@ -7197,7 +7270,8 @@ class AgenticSearch(BaseSearch):
                 intent=data_reqs.intent,
             )
 
-        # Fallback: if zero evidence after loop, extract first N pages
+        # Fallback: if zero evidence after loop, try broad page extraction
+        # for paginated files and direct content read for non-paginated ones.
         if not evidence_parts:
             await self._logger.warning(
                 f"[Phase 4] Zero evidence after retrieval loop, "
@@ -7220,6 +7294,19 @@ class AgenticSearch(BaseSearch):
                     pages_extracted.setdefault(fp, set()).update(pages)
                 except Exception:
                     continue
+
+            # Non-paginated fallback for files not yet extracted
+            if not evidence_parts:
+                for fp in target_files:
+                    if fp in pages_extracted:
+                        continue
+                    content = await self._extract_non_paginated_content(
+                        fp, query,
+                    )
+                    if content:
+                        evidence_parts.append(content)
+                        pages_extracted[fp] = set()
+                        break
 
         combined = "\n\n".join(evidence_parts)
         return RetrievalResult(
