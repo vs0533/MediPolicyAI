@@ -6,7 +6,12 @@ Provides WebSocket endpoint for real-time chat conversations with integrated sea
 import logging
 import platform
 import re
+import threading
 import time
+import zipfile
+import xml.etree.ElementTree as ET
+from collections import Counter
+from pathlib import Path
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Request
 from typing import Dict, Any, List, Optional, Union, Tuple
@@ -17,7 +22,6 @@ import uuid
 from datetime import datetime
 import random
 import os
-import threading
 
 import openai
 
@@ -43,6 +47,37 @@ logger = logging.getLogger(__name__)
 # this is a coarser-grained retry around the entire search pipeline.
 _RAG_PIPELINE_MAX_RETRIES = 1
 _RAG_PIPELINE_RETRY_DELAY = 2.0  # seconds
+_QUESTION_STATS_LOCK = threading.Lock()
+_QUESTION_SUGGESTIONS_CACHE: Optional[Dict[str, Any]] = None
+_QUESTION_SUGGESTIONS_CACHE_KEY: Optional[Tuple[Tuple[str, float], ...]] = None
+
+_DEFAULT_POLICY_QUESTIONS = [
+    "医保报销范围怎么判断？",
+    "异地就医备案怎么办理？",
+    "门诊慢特病政策有哪些？",
+]
+
+_POLICY_TOPIC_QUESTIONS = [
+    (("报销", "支付", "目录", "诊疗项目", "服务设施", "耗材"), "医保报销范围怎么判断？"),
+    (("异地", "备案", "转诊", "联网结算"), "异地就医备案怎么办理？"),
+    (("门诊慢特病", "慢特病", "门诊慢性病"), "门诊慢特病政策有哪些？"),
+    (("个人账户", "门诊共济", "共济保障"), "职工医保个人账户改革后怎么计入和使用？"),
+    (("互联网+", "互联网", "复诊", "移动支付"), "互联网+医疗服务医保结算有哪些要求？"),
+    (("长期护理", "长护险", "护理保险"), "长期护理保险待遇和服务范围有哪些？"),
+    (("辅助器具", "租赁", "限额"), "长护险辅助器具租赁怎么支付？"),
+    (("定点医疗机构", "服务协议", "协议管理"), "定点医疗机构医保服务协议有哪些主要要求？"),
+    (("定点零售药店", "零售药店", "药店"), "定点零售药店医保服务有哪些要求？"),
+    (("中医日间", "日间诊疗", "中医"), "中医日间诊疗医保试点政策有哪些？"),
+    (("医保基金", "基金监管", "违规", "解除协议"), "哪些行为会影响医保基金支付或协议资格？"),
+    (("国家谈判药品", "双通道", "谈判药"), "国家谈判药品双通道管理有哪些要求？"),
+]
+
+_PUBLIC_POLICY_KEYWORDS = (
+    "医保", "医疗", "参保", "报销", "异地", "门诊", "慢特病", "慢性病",
+    "定点", "药店", "药品", "耗材", "基金", "协议", "结算", "账户",
+    "长护", "护理", "互联网", "费用", "支付", "备案", "谈判", "双通道",
+    "中医", "日间", "失能", "评估", "住院", "处方", "复诊", "待遇",
+)
 
 
 def _is_transient_llm_error(exc: Exception) -> bool:
@@ -105,6 +140,226 @@ def _resolve_rag_paths(kb_name: str) -> Tuple[List[str], str]:
     paths = _parse(env_paths)
     display = ", ".join(paths) if paths else ""
     return paths, display
+
+
+def _work_path() -> Path:
+    return Path(os.getenv("SIRCHMUNK_WORK_PATH", os.path.expanduser("~/.sirchmunk"))).expanduser()
+
+
+def _question_stats_path() -> Path:
+    return _work_path() / "question_stats.json"
+
+
+def _normalize_question_text(question: str) -> str:
+    normalized = re.sub(r"\s+", " ", question or "").strip()
+    normalized = normalized.strip(" \t\r\n\"'“”‘’")
+    if len(normalized) > 120:
+        normalized = normalized[:120].rstrip()
+    return normalized
+
+
+def _is_public_policy_question(question: str) -> bool:
+    text = _normalize_question_text(question)
+    if len(text) < 4:
+        return False
+    return any(keyword in text for keyword in _PUBLIC_POLICY_KEYWORDS)
+
+
+def _load_question_stats() -> Dict[str, Dict[str, Any]]:
+    path = _question_stats_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    stats: Dict[str, Dict[str, Any]] = {}
+    for question, payload in data.items():
+        if not isinstance(question, str) or not isinstance(payload, dict):
+            continue
+        count = int(payload.get("count") or 0)
+        if count <= 0:
+            continue
+        stats[question] = {
+            "count": count,
+            "last_asked_at": str(payload.get("last_asked_at") or ""),
+        }
+    return stats
+
+
+def _save_question_stats(stats: Dict[str, Dict[str, Any]]) -> None:
+    path = _question_stats_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(stats, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def _record_user_question(question: str) -> None:
+    normalized = _normalize_question_text(question)
+    if len(normalized) < 2:
+        return
+    with _QUESTION_STATS_LOCK:
+        stats = _load_question_stats()
+        item = stats.setdefault(normalized, {"count": 0, "last_asked_at": ""})
+        item["count"] = int(item.get("count") or 0) + 1
+        item["last_asked_at"] = datetime.now().isoformat()
+        _save_question_stats(stats)
+
+
+def _top_user_questions(limit: int = 15) -> List[Dict[str, Any]]:
+    stats = _load_question_stats()
+    rows = [
+        {
+            "question": question,
+            "count": int(payload.get("count") or 0),
+            "last_asked_at": payload.get("last_asked_at") or "",
+        }
+        for question, payload in stats.items()
+        if _is_public_policy_question(question)
+    ]
+    rows.sort(key=lambda row: (-row["count"], row["last_asked_at"], row["question"]))
+    return rows[:limit]
+
+
+def _bootstrap_question_stats_from_history() -> None:
+    if _load_question_stats():
+        return
+    try:
+        rows = history_storage.db.fetch_all(
+            """
+            SELECT content, MAX(timestamp) AS last_asked_at, COUNT(*) AS count
+            FROM chat_messages
+            WHERE role = 'user'
+            GROUP BY content
+            ORDER BY count DESC, last_asked_at DESC
+            LIMIT 200
+            """
+        )
+    except Exception:
+        logger.debug("Question stats bootstrap skipped; chat history is unavailable")
+        return
+
+    stats: Dict[str, Dict[str, Any]] = {}
+    for content, last_asked_at, count in rows:
+        question = _normalize_question_text(str(content or ""))
+        if len(question) < 2:
+            continue
+        stats[question] = {
+            "count": int(count or 0),
+            "last_asked_at": str(last_asked_at or ""),
+        }
+    if stats:
+        with _QUESTION_STATS_LOCK:
+            if not _load_question_stats():
+                _save_question_stats(stats)
+
+
+def _candidate_policy_doc_dirs() -> List[Path]:
+    paths: List[Path] = []
+    for raw in os.getenv("SIRCHMUNK_SEARCH_PATHS", "").replace("，", ",").split(","):
+        raw = raw.strip()
+        if raw:
+            paths.append(Path(raw).expanduser())
+    project_policy_docs = Path.cwd() / "policy-docs"
+    paths.append(project_policy_docs)
+
+    deduped: List[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        key = str(resolved)
+        if key not in seen and resolved.exists():
+            seen.add(key)
+            deduped.append(resolved)
+    return deduped
+
+
+def _policy_docx_files() -> List[Path]:
+    files: List[Path] = []
+    for root in _candidate_policy_doc_dirs():
+        if root.is_file() and root.suffix.lower() == ".docx" and not root.name.startswith("~$"):
+            files.append(root)
+        elif root.is_dir():
+            files.extend(
+                path for path in root.rglob("*.docx")
+                if path.is_file() and not path.name.startswith("~$")
+            )
+    files.sort(key=lambda path: str(path))
+    return files
+
+
+def _extract_docx_text(path: Path, *, max_chars: int = 50000) -> str:
+    """Extract visible text from a docx without adding runtime dependencies."""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            with zf.open("word/document.xml") as fh:
+                root = ET.fromstring(fh.read())
+    except Exception:
+        return ""
+
+    namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    parts: List[str] = []
+    total = 0
+    for node in root.findall(".//w:t", namespace):
+        if not node.text:
+            continue
+        text = node.text.strip()
+        if not text:
+            continue
+        parts.append(text)
+        total += len(text)
+        if total >= max_chars:
+            break
+    return " ".join(parts)
+
+
+def _build_policy_question_suggestions(limit: int = 6) -> List[str]:
+    global _QUESTION_SUGGESTIONS_CACHE, _QUESTION_SUGGESTIONS_CACHE_KEY
+
+    files = _policy_docx_files()
+    cache_key = tuple((str(path), path.stat().st_mtime) for path in files)
+    if (
+        _QUESTION_SUGGESTIONS_CACHE
+        and _QUESTION_SUGGESTIONS_CACHE_KEY == cache_key
+        and len(_QUESTION_SUGGESTIONS_CACHE.get("questions", [])) >= limit
+    ):
+        return list(_QUESTION_SUGGESTIONS_CACHE["questions"][:limit])
+
+    corpus_parts = [path.stem for path in files]
+    for path in files:
+        text = _extract_docx_text(path)
+        if text:
+            corpus_parts.append(text)
+    corpus = "\n".join(corpus_parts)
+
+    scores: Counter[str] = Counter()
+    for keywords, question in _POLICY_TOPIC_QUESTIONS:
+        score = 0
+        for keyword in keywords:
+            score += corpus.count(keyword)
+        if score > 0:
+            scores[question] = score
+
+    questions = [question for question, _ in scores.most_common(limit)]
+    for question in _DEFAULT_POLICY_QUESTIONS:
+        if question not in questions:
+            questions.append(question)
+        if len(questions) >= limit:
+            break
+
+    _QUESTION_SUGGESTIONS_CACHE = {
+        "questions": questions,
+        "docx_count": len(files),
+    }
+    _QUESTION_SUGGESTIONS_CACHE_KEY = cache_key
+    return questions[:limit]
 
 
 # ---------------------------------------------------------------------------
@@ -1313,6 +1568,7 @@ async def chat_websocket(websocket: WebSocket):
             search_mode = request_data.get("search_mode", "FAST")
 
             logger.debug("Chat request: rag=%s, mode=%s", enable_rag, search_mode)
+            _record_user_question(message)
             
             # Generate or use existing session ID
             if not session_id:
@@ -1465,6 +1721,33 @@ async def chat_websocket(websocket: WebSocket):
         except:
             pass
         manager.disconnect(websocket)
+
+
+@router.get("/chat/question-suggestions")
+async def get_question_suggestions(limit: int = 6, popular_limit: int = 15):
+    """Return prebuilt policy questions and aggregated public question frequency."""
+    safe_limit = max(1, min(int(limit or 6), 12))
+    safe_popular_limit = max(1, min(int(popular_limit or 15), 30))
+    try:
+        _bootstrap_question_stats_from_history()
+        preset_questions = _build_policy_question_suggestions(limit=safe_limit)
+        popular_questions = _top_user_questions(limit=safe_popular_limit)
+        return {
+            "success": True,
+            "data": {
+                "preset_questions": preset_questions,
+                "popular_questions": popular_questions,
+            },
+        }
+    except Exception:
+        logger.exception("Failed to build question suggestions")
+        return {
+            "success": True,
+            "data": {
+                "preset_questions": _DEFAULT_POLICY_QUESTIONS[:safe_limit],
+                "popular_questions": _top_user_questions(limit=safe_popular_limit),
+            },
+        }
 
 
 # File picker endpoints

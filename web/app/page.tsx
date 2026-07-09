@@ -31,6 +31,24 @@ import {
   POLICY_KNOWLEDGE_LABEL,
   POLICY_KNOWLEDGE_PATH,
 } from "@/lib/public-service";
+import { apiUrl } from "@/lib/api";
+
+type PopularQuestion = {
+  question: string;
+  count: number;
+  last_asked_at?: string;
+};
+
+type QuestionSuggestions = {
+  preset_questions: string[];
+  popular_questions: PopularQuestion[];
+};
+
+const FALLBACK_PRESET_QUESTIONS = [
+  "医保报销范围怎么判断？",
+  "异地就医备案怎么办理？",
+  "门诊慢特病政策有哪些？",
+];
 
 export default function HomePage() {
   const {
@@ -42,8 +60,33 @@ export default function HomePage() {
     clearChatHistory,
   } = useGlobal();
   const [inputMessage, setInputMessage] = useState("");
+  const [questionSuggestions, setQuestionSuggestions] = useState<QuestionSuggestions>({
+    preset_questions: FALLBACK_PRESET_QUESTIONS,
+    popular_questions: [],
+  });
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  const loadQuestionSuggestions = async () => {
+    try {
+      const response = await fetch(apiUrl("/api/v1/chat/question-suggestions?limit=3&popular_limit=15"));
+      const payload = await response.json();
+      const data = payload?.data;
+      if (!payload?.success || !data) return;
+      setQuestionSuggestions({
+        preset_questions:
+          Array.isArray(data.preset_questions) && data.preset_questions.length > 0
+            ? data.preset_questions
+            : FALLBACK_PRESET_QUESTIONS,
+        popular_questions: Array.isArray(data.popular_questions) ? data.popular_questions : [],
+      });
+    } catch {
+      setQuestionSuggestions((prev) => ({
+        ...prev,
+        preset_questions: prev.preset_questions.length > 0 ? prev.preset_questions : FALLBACK_PRESET_QUESTIONS,
+      }));
+    }
+  };
 
   useEffect(() => {
     setChatState((prev) => ({
@@ -53,6 +96,7 @@ export default function HomePage() {
       selectedKb: POLICY_KNOWLEDGE_PATH,
       searchMode: "FAST",
     }));
+    loadQuestionSuggestions();
   }, [setChatState]);
 
   useEffect(() => {
@@ -73,6 +117,7 @@ export default function HomePage() {
     if (!message || chatState.isLoading) return;
     sendChatMessage(message);
     setInputMessage("");
+    window.setTimeout(loadQuestionSuggestions, 1000);
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
@@ -147,7 +192,7 @@ export default function HomePage() {
                 isLoading={chatState.isLoading}
               />
               <div className="mt-5 grid grid-cols-1 sm:grid-cols-3 gap-3">
-                {["医保报销范围怎么判断？", "异地就医备案怎么办理？", "门诊慢特病政策有哪些？"].map((text) => (
+                {questionSuggestions.preset_questions.slice(0, 3).map((text) => (
                   <button
                     key={text}
                     onClick={() => setInputMessage(text)}
@@ -157,6 +202,33 @@ export default function HomePage() {
                   </button>
                 ))}
               </div>
+              {questionSuggestions.popular_questions.length > 0 && (
+                <section className="mt-6">
+                  <div className="mb-2 flex items-center justify-between gap-3">
+                    <h3 className="text-sm font-medium text-slate-600 dark:text-slate-300">
+                      大家常问
+                    </h3>
+                    <span className="text-xs text-slate-400 dark:text-slate-500">
+                      按提问频率排序
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {questionSuggestions.popular_questions.slice(0, 15).map((item) => (
+                      <button
+                        key={item.question}
+                        onClick={() => setInputMessage(item.question)}
+                        className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1.5 text-xs text-slate-600 dark:text-slate-300 hover:border-teal-300 dark:hover:border-teal-600 hover:text-teal-700 dark:hover:text-teal-300 transition-colors"
+                        title={`已被提问 ${item.count} 次`}
+                      >
+                        <span className="truncate">{item.question}</span>
+                        <span className="shrink-0 text-slate-400 dark:text-slate-500">
+                          {item.count}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </section>
+              )}
             </div>
           </div>
         ) : (

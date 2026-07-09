@@ -147,6 +147,7 @@ venv.bak/
 .env
 *.mcp_env
 tests/.env.test
+.sirchmunk/
 
 # Spyder project settings
 .spyderproject
