@@ -185,7 +185,7 @@ Synthesize a structured response based on the User Input and the provided Eviden
 
 SEARCH_RESULT_SUMMARY = """
 ### Task
-Analyze the provided {text_content} and generate a concise summary in the form of a Markdown Briefing.
+Analyze the provided {text_content} and generate a concise answer.
 
 ### Constraints
 1. **Language Continuity**: The output must be in the SAME language as the User Input.
@@ -439,8 +439,8 @@ Analyze the provided {text_content} and generate a concise summary in the form o
 1. **Language Continuity**: The output must be in the SAME language as the User Input.
 2. ONLY use data explicitly stated in the evidence. If a required value is not found in the evidence, output SHOULD_ANSWER=false rather than inferring, estimating, or using your own knowledge. Never fabricate numbers that do not appear verbatim in the evidence.
 3. When the question asks to LIST or IDENTIFY specific items (securities, products, subsidiaries, etc.), enumerate ALL individual instances with their exact identifiers (ticker symbols, ISIN codes, names, amounts) — do not summarize into generic categories.
-4. **Format**: Use Markdown (headings, bullet points, and bold text) for high readability.
-5. **Style**: Keep it professional, objective, and clear. Avoid fluff.
+4. **Format**: Keep the SUMMARY short: no more than 6 bullet points or 2 short paragraphs. Do NOT use Markdown tables.
+5. **Style**: Keep it professional, objective, clear, and suitable for a public policy Q&A service. Avoid fluff and repeated conclusions.
 6. **Precision**: When the query asks for a specific value, ratio, number, percentage, or yes/no determination, you MUST compute it and state the precise result. Show key calculation steps when applicable.
 7. **Verify before answering**: For numerical calculations, complete ALL computation steps in the SUMMARY section FIRST. Only write the PRECISE_ANSWER tag AFTER you have verified the final result. If you discover an error during computation, use the corrected value in PRECISE_ANSWER.
 8. **Rounding**: When converting units (thousands → millions, millions → billions), round to the nearest whole number in the target unit if result ≥10; use 2 decimal places if result <10. Examples: $5,466,312 thousands → "$5,466 million"; $389 million → "$0.39 billion". Percentages: round to 1 decimal place. When the query specifies a rounding rule, follow it exactly.
@@ -466,7 +466,7 @@ Evaluate based on:
 
 ### Output Format
 <SUMMARY>
-[Generate the Markdown Briefing here with detailed analysis, supporting evidence, and full calculation steps. Complete all reasoning BEFORE the PRECISE_ANSWER tag.]
+[Generate a concise answer here. Use no more than 6 bullets or 2 short paragraphs. Do not include tables.]
 </SUMMARY>
 <PRECISE_ANSWER>
 [State ONLY the final verified answer. CRITICAL: For yes/no questions, the FIRST word MUST be "Yes" or "No". For identification questions ("What is the largest…?"), state the name/label. For value questions, state the number with units (e.g. "$1,832 million", "39.7%"). For calculations, this MUST reflect the result from your completed computation above. If the query is open-ended, write a one-sentence conclusion.]
@@ -477,13 +477,13 @@ Evaluate based on:
 
 ROI_RESULT_SUMMARY_WITH_CONTEXT = """
 ### Task
-Analyze the provided evidence and generate a concise summary in the form of a Markdown Briefing.
+Analyze the provided evidence and generate a concise answer.
 Leverage the document context below for better understanding of the source material's structure and purpose.
 
 ### Constraints
 1. **Language Continuity**: The output must be in the SAME language as the User Input.
-2. **Format**: Use Markdown (headings, bullet points, and bold text) for high readability.
-3. **Style**: Keep it professional, objective, and clear. Avoid fluff.
+2. **Format**: Keep the SUMMARY short: no more than 6 bullet points or 2 short paragraphs. Do NOT use Markdown tables.
+3. **Style**: Keep it professional, objective, clear, and suitable for a public policy Q&A service. Avoid fluff and repeated conclusions.
 4. **Precision**: When the query asks for a specific value, ratio, number, percentage, or yes/no determination, you MUST compute it and state the precise result. Show key calculation steps when applicable.
 5. **Verify before answering**: For numerical calculations, complete ALL computation steps in the SUMMARY section FIRST. Only write the PRECISE_ANSWER tag AFTER you have verified the final result. If you discover an error during computation, use the corrected value in PRECISE_ANSWER.
 6. **Rounding**: When converting units (thousands → millions, millions → billions), round to the nearest whole number in the target unit if result ≥10; use 2 decimal places if result <10. Examples: $5,466,312 thousands → "$5,466 million"; $389 million → "$0.39 billion". Percentages: round to 1 decimal place. When the query specifies a rounding rule, follow it exactly.
@@ -512,7 +512,7 @@ Evaluate based on:
 
 ### Output Format
 <SUMMARY>
-[Generate the Markdown Briefing here with detailed analysis, supporting evidence, and full calculation steps. Complete all reasoning BEFORE the PRECISE_ANSWER tag.]
+[Generate a concise answer here. Use no more than 6 bullets or 2 short paragraphs. Do not include tables.]
 </SUMMARY>
 <PRECISE_ANSWER>
 [State ONLY the final verified answer. CRITICAL: For yes/no questions, the FIRST word MUST be "Yes" or "No". For identification questions ("What is the largest…?"), state the name/label. For value questions, state the number with units (e.g. "$1,832 million", "39.7%"). For calculations, this MUST reflect the result from your completed computation above. If the query is open-ended, write a one-sentence conclusion.]
@@ -934,7 +934,7 @@ COMPILE_DOC_SUMMARY = """Summarize the following document concisely, capturing t
 {document_content}
 
 ### Output
-Provide a comprehensive summary in 3-8 sentences. Focus on:
+Provide a comprehensive summary in 3-8 sentences. Do not include hidden reasoning, <think> blocks, XML-like control tags, JSON fences, or Markdown tables. Focus on:
 1. What is this document about (main topic/purpose)
 2. Key findings, arguments, or conclusions
 3. Important details, data points, or methodologies

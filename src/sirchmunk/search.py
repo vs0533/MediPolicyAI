@@ -82,6 +82,21 @@ _CHAT_QUERY_RE = re.compile(
     re.IGNORECASE,
 )
 
+
+def _clean_cached_llm_text(text: str) -> str:
+    """Remove provider reasoning/control markup from compiled cache text."""
+    cleaned = re.sub(r"<think>.*?</think>", "", text or "", flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(
+        r"</?(?:SUMMARY|PRECISE_ANSWER|SHOULD_ANSWER|SHOULD_SAVE)>",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\[content\]", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"```(?:json|markdown)?\s*([\s\S]*?)```", r"\1", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
 _CHAT_RESPONSE_SYSTEM = (
     "You are Sirchmunk, an intelligent document search and analysis assistant. "
     "The user sent a conversational message (greeting, identity question, etc.) "
@@ -1102,9 +1117,7 @@ class AgenticSearch(BaseSearch):
         should_answer = should_answer_str in ["true", "yes", "1"]
         should_save = should_save_str in ["true", "yes", "1"]
 
-        if precise and summary:
-            summary = f"**Answer: {precise}**\n\n{summary}"
-        elif precise:
+        if precise:
             summary = precise
 
         if not summary:
@@ -4036,6 +4049,9 @@ class AgenticSearch(BaseSearch):
         try:
             entries = json.loads(catalog_path.read_text(encoding="utf-8"))
             if isinstance(entries, list) and entries:
+                for entry in entries:
+                    if isinstance(entry, dict) and "summary" in entry:
+                        entry["summary"] = _clean_cached_llm_text(str(entry.get("summary") or ""))
                 return entries
         except Exception:
             pass
@@ -4083,6 +4099,9 @@ class AgenticSearch(BaseSearch):
                     manifest_path.read_text(encoding="utf-8")
                 )
                 manifest_map = manifest.files  # {file_path: FileManifestEntry}
+                for entry in manifest_map.values():
+                    if getattr(entry, "summary", None):
+                        entry.summary = _clean_cached_llm_text(entry.summary)
             except Exception:
                 pass
 
@@ -4120,6 +4139,9 @@ class AgenticSearch(BaseSearch):
             try:
                 from sirchmunk.learnings.summary_index import CompileSummaryIndex
                 summary_index = CompileSummaryIndex.load(summary_index_path)
+                if summary_index is not None:
+                    for entry in getattr(summary_index, "_entries", []):
+                        entry.summary = _clean_cached_llm_text(getattr(entry, "summary", ""))
             except Exception:
                 pass
 

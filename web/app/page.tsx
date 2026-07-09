@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import type { KeyboardEvent, RefObject } from "react";
 import Image from "next/image";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import "katex/dist/katex.min.css";
@@ -183,8 +184,8 @@ export default function HomePage() {
                         : "bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-200 shadow-sm"
                     }`}
                   >
-                    <div className="prose prose-slate dark:prose-invert prose-sm max-w-none">
-                      <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
+                    <div className="prose prose-slate dark:prose-invert prose-sm max-w-none prose-table:text-xs prose-th:bg-slate-50 dark:prose-th:bg-slate-900 prose-td:align-top">
+                      <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
                         {processLatexContent(msg.content)}
                       </ReactMarkdown>
                     </div>
@@ -201,21 +202,24 @@ export default function HomePage() {
                   {msg.role === "assistant" &&
                     msg.sources?.references &&
                     msg.sources.references.length > 0 && (
-                      <details className="mt-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800">
-                        <summary className="flex items-center gap-2 px-3 py-2 cursor-pointer text-xs font-medium text-slate-600 dark:text-slate-300">
+                      <details
+                        open
+                        className="mt-2 rounded-lg border border-teal-100 dark:border-teal-800 bg-white dark:bg-slate-800"
+                      >
+                        <summary className="flex items-center gap-2 px-3 py-2 cursor-pointer text-xs font-medium text-teal-700 dark:text-teal-300">
                           <BookOpen className="w-3.5 h-3.5 text-teal-500" />
-                          参考依据 ({msg.sources.references.length})
+                          参考依据：已命中 {msg.sources.references.length} 个政策文件
                         </summary>
                         <div className="divide-y divide-slate-100 dark:divide-slate-700">
                           {msg.sources.references.map((ref, refIndex) => (
                             <div key={refIndex} className="px-3 py-2.5 space-y-1.5">
-                              <div className="flex items-center gap-1.5 text-xs font-medium text-slate-700 dark:text-slate-300">
+                              <div className="flex items-start gap-1.5 text-xs font-medium text-slate-700 dark:text-slate-300">
                                 <FileText className="w-3.5 h-3.5 text-teal-500 shrink-0" />
-                                <span className="truncate">{ref.file.split("/").pop()}</span>
+                                <span className="break-words">{formatReferenceTitle(ref.file, refIndex)}</span>
                               </div>
                               {ref.summary && (
                                 <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
-                                  {ref.summary}
+                                  {cleanReferenceText(ref.summary, 220)}
                                 </p>
                               )}
                               {ref.snippets?.slice(0, 2).map((snippet: string, snippetIndex: number) => (
@@ -223,7 +227,7 @@ export default function HomePage() {
                                   key={snippetIndex}
                                   className="text-xs bg-slate-50 dark:bg-slate-900 text-slate-600 dark:text-slate-400 px-2 py-1.5 rounded leading-relaxed"
                                 >
-                                  {snippet}
+                                  {cleanReferenceText(snippet, 260)}
                                 </p>
                               ))}
                             </div>
@@ -403,6 +407,23 @@ function sanitizeSearchLog(message: string) {
 function extractDisplayFileName(message: string) {
   const match = message.match(/Best file \([^)]+\):\s*(.*?)\s*\(/);
   return match?.[1]?.trim();
+}
+
+function formatReferenceTitle(file: string, index: number) {
+  const name = file.split("/").pop()?.trim();
+  return name || `政策依据 ${index + 1}`;
+}
+
+function cleanReferenceText(value: string, maxLength: number) {
+  const text = (value || "")
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/\[role=assistant\][\s\S]*/gi, "")
+    .replace(/```(?:json|markdown)?\s*([\s\S]*?)```/gi, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength).replace(/[，,；;。.\s]+$/, "")}...`;
 }
 
 function QuestionInput({

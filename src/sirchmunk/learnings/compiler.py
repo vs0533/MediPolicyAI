@@ -131,6 +131,21 @@ _STANDALONE_LINE_RE = re.compile(
 
 _HEADING_CANDIDATE_CAP = 40
 
+
+def _clean_llm_visible_text(text: str) -> str:
+    """Strip provider reasoning/control markup before caching compiler text."""
+    cleaned = re.sub(r"<think>.*?</think>", "", text or "", flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(
+        r"</?(?:SUMMARY|PRECISE_ANSWER|SHOULD_ANSWER|SHOULD_SAVE)>",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\[content\]", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"```(?:json|markdown)?\s*([\s\S]*?)```", r"\1", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
 # Excel table-level adaptive sampling constants
 _XLSX_TOTAL_ROW_BUDGET = 100       # Total sampled rows budget across all sheets
 _XLSX_MIN_ROWS_PER_SHEET = 3       # Minimum sampled rows per sheet
@@ -942,7 +957,7 @@ class KnowledgeCompiler:
         """
         if tree and tree.root and tree.root.summary:
             if not self._is_generic_summary(tree.root.summary):
-                return tree.root.summary
+                return _clean_llm_visible_text(tree.root.summary)
             await self._log.info(
                 f"[Compile] Root summary too generic for {Path(file_path).name}, "
                 f"falling back to LLM summarization"
@@ -955,7 +970,7 @@ class KnowledgeCompiler:
             document_content=preview,
         )
         resp = await self._llm.achat([{"role": "user", "content": prompt}])
-        return resp.content.strip()
+        return _clean_llm_visible_text(resp.content)
 
     @staticmethod
     def _build_summary_preview(content: str) -> str:

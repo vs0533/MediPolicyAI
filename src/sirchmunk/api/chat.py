@@ -126,6 +126,75 @@ def _strip_thinking_content(text: str) -> str:
     return text.strip()
 
 
+def _strip_markdown_tables(text: str) -> str:
+    """Remove raw Markdown table blocks from public answers.
+
+    The public chat UI is optimized for concise policy answers. Large tables
+    from source evidence often render poorly during streaming and are harder
+    for citizens to scan than short bullets.
+    """
+    lines = (text or "").splitlines()
+    kept: List[str] = []
+    in_table = False
+
+    for line in lines:
+        stripped = line.strip()
+        is_table_line = stripped.startswith("|") and stripped.endswith("|")
+        is_separator = bool(re.fullmatch(r"\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?", stripped))
+
+        if is_table_line or is_separator:
+            in_table = True
+            continue
+
+        if in_table and not stripped:
+            in_table = False
+            continue
+
+        kept.append(line)
+
+    return "\n".join(kept)
+
+
+def _clean_public_answer_text(text: str, *, max_chars: int = 900) -> str:
+    """Normalize final public-service answers into a short, readable shape."""
+    cleaned = _strip_markdown_tables(_strip_thinking_content(text or ""))
+    cleaned = re.sub(r"</?(?:SUMMARY|PRECISE_ANSWER|SHOULD_ANSWER|SHOULD_SAVE)>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\[content\]", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\*\*Answer:\s*(.*?)\*\*", r"答案：\1", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"^\s*\*\*答案[:：]\*\*\s*", "答案：", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^\s*答案[:：]\s*答案[:：]\s*", "答案：", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    if len(cleaned) <= max_chars:
+        return cleaned
+
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", cleaned) if p.strip()]
+    if paragraphs:
+        shortened: List[str] = []
+        total = 0
+        for paragraph in paragraphs:
+            if total + len(paragraph) > max_chars:
+                break
+            shortened.append(paragraph)
+            total += len(paragraph) + 2
+            if len(shortened) >= 4:
+                break
+        if shortened:
+            return "\n\n".join(shortened).strip()
+
+    return cleaned[:max_chars].rstrip("，,；;。 ") + "。"
+
+
+def _clean_reference_text(text: str, *, max_chars: int = 320) -> str:
+    cleaned = _strip_markdown_tables(_strip_thinking_content(text or ""))
+    cleaned = re.sub(r"\[role=assistant\].*", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"```(?:json|markdown)?\s*([\s\S]*?)```", r"\1", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[:max_chars].rstrip("，,；;。 ") + "..."
+
+
 def _extract_query_text(text: str, fallback: str) -> str:
     """Extract a single search query from model output."""
     cleaned = _strip_thinking_content(text).strip().strip("`").strip()
@@ -154,7 +223,7 @@ def _clean_tagged_answer_text(text: str) -> str:
         precise = concise_match.group(1).strip()
 
     if precise and summary:
-        cleaned = f"**答案：** {precise}\n\n{summary}"
+        cleaned = precise if is_public_service_mode() else f"**答案：** {precise}\n\n{summary}"
     elif precise:
         cleaned = precise
     elif summary:
@@ -169,7 +238,10 @@ def _clean_tagged_answer_text(text: str) -> str:
     cleaned = re.sub(r"\[content\]", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\*\*Answer:\s*(.*?)\*\*", r"**答案：** \1", cleaned, flags=re.IGNORECASE | re.DOTALL)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
+    cleaned = cleaned.strip()
+    if is_public_service_mode():
+        cleaned = _clean_public_answer_text(cleaned)
+    return cleaned
 
 
 def _build_chat_history(
@@ -896,8 +968,8 @@ async def _run_rag_search(
                         snippets.append(str(s))
                 references.append({
                     "file": str(ev.file_or_url),
-                    "summary": ev.summary or "",
-                    "snippets": snippets,
+                    "summary": _clean_reference_text(ev.summary or "", max_chars=260),
+                    "snippets": [_clean_reference_text(snippet, max_chars=320) for snippet in snippets],
                 })
     else:
         answer = result if isinstance(result, str) else str(result)
@@ -1336,16 +1408,19 @@ async def chat_websocket(websocket: WebSocket):
             # ============================================================
             # Stream response to client
             # ============================================================
-            words = response.split()
-            
-            for i, word in enumerate(words):
+            chunks = re.split(r"(\s+)", response)
+
+            for i, chunk in enumerate(chunks):
+                if not chunk:
+                    continue
                 await manager.send_personal_message(json.dumps({
                     "type": "stream",
-                    "content": word + " "
+                    "content": chunk
                 }), websocket)
-                
-                # Add small delay for realistic streaming
-                if i % 3 == 0:  # Every 3 words
+
+                # Add small delay for realistic streaming without destroying
+                # Markdown newlines or list structure.
+                if i % 8 == 0:
                     await asyncio.sleep(0.05)
             
             # Send sources if available
