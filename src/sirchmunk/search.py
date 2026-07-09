@@ -3374,6 +3374,10 @@ class AgenticSearch(BaseSearch):
         await self._logger.info(
             f"[FAST:Step4] Evidence acceptance: {accepted} ({accept_reason})"
         )
+        # ponytail: 临时诊断 —— 排查"证据充足却判 No results"，确认后删除 D19-D21
+        print(f"SEARCH_WIKI_DEBUG [D19] accepted={accepted} reason={accept_reason} should_answer={should_answer} should_save={should_save} evidence_len={len(evidence)}", flush=True)
+        print(f"SEARCH_WIKI_DEBUG [D20] evidence_head={evidence[:300]!r}", flush=True)
+        print(f"SEARCH_WIKI_DEBUG [D21] llm_raw_head={(answer_resp.content or '')[:500]!r}", flush=True)
 
         # ==============================================================
         # Step 5: Self-correction retry (conditional, ≤1 extra LLM call)
@@ -3422,6 +3426,10 @@ class AgenticSearch(BaseSearch):
                 await self._logger.warning(
                     "[FAST:Step5] Evidence rejected after retry, llm_fallback=False "
                     "→ returning no results"
+                )
+                await self._logger.warning(
+                    "[FAST:Step5] Candidate files were found, but the extracted evidence "
+                    "was not sufficient to answer the user question"
                 )
                 return _NO_RESULTS_MESSAGE, None, context
 
