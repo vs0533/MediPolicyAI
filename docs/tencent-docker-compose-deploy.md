@@ -15,6 +15,8 @@
 - `TENCENT_PORT`：SSH 端口，默认 `22`
 - `TENCENT_DEPLOY_PATH`：部署目录，默认 `/opt/medipolicyai`
 
+如果部署日志出现 `Permission denied (publickey,password)`，通常是 `SSH_PRIVATE_KEY` 和服务器用户不匹配。请确认私钥对应目标用户的 `~/.ssh/authorized_keys`，并配置正确的 `TENCENT_USER`，例如 `root`、`ubuntu` 或你的实际登录用户。
+
 ## 服务器目录
 
 部署后目录结构：

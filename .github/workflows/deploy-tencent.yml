@@ -84,11 +84,30 @@ jobs:
           REMOTE_PORT="${TENCENT_PORT:-22}"
           ssh-keyscan -p "$REMOTE_PORT" -H "$TENCENT_HOST" >> ~/.ssh/known_hosts
 
+      - name: 检查 SSH 登录
+        run: |
+          REMOTE_USER="${TENCENT_USER:-root}"
+          REMOTE_PORT="${TENCENT_PORT:-22}"
+          if ! ssh \
+            -p "$REMOTE_PORT" \
+            -i ~/.ssh/tencent_key \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            "${REMOTE_USER}@${TENCENT_HOST}" \
+            "echo '[deploy] SSH login ok'"; then
+            echo "::error::SSH 登录失败。当前使用用户：${REMOTE_USER}。请确认 SSH_PRIVATE_KEY 对应服务器 authorized_keys，并在 GitHub Secrets 中配置正确的 TENCENT_USER（例如 ubuntu/root/实际登录用户）。"
+            exit 1
+          fi
+
       - name: 上传源码包
         run: |
           REMOTE_USER="${TENCENT_USER:-root}"
           REMOTE_PORT="${TENCENT_PORT:-22}"
-          scp -P "$REMOTE_PORT" -i ~/.ssh/tencent_key \
+          scp \
+            -P "$REMOTE_PORT" \
+            -i ~/.ssh/tencent_key \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
             /tmp/medipolicyai-${GITHUB_SHA}.tar.gz \
             "${REMOTE_USER}@${TENCENT_HOST}:/tmp/medipolicyai-${GITHUB_SHA}.tar.gz"
 
@@ -97,7 +116,12 @@ jobs:
           REMOTE_USER="${TENCENT_USER:-root}"
           REMOTE_PORT="${TENCENT_PORT:-22}"
           DEPLOY_PATH="${TENCENT_DEPLOY_PATH:-/opt/medipolicyai}"
-          ssh -p "$REMOTE_PORT" -i ~/.ssh/tencent_key "${REMOTE_USER}@${TENCENT_HOST}" \
+          ssh \
+            -p "$REMOTE_PORT" \
+            -i ~/.ssh/tencent_key \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            "${REMOTE_USER}@${TENCENT_HOST}" \
             "DEPLOY_PATH='$DEPLOY_PATH' GITHUB_SHA='$GITHUB_SHA' bash -s" <<'REMOTE'
           set -euo pipefail
 
