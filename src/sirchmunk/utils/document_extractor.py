@@ -300,7 +300,7 @@ class DocumentExtractor:
         config = DocumentExtractor._build_config(profile)
 
         try:
-            result = await extract_file(file_path=file_path, config=config)
+            result = await extract_file(str(file_path), config=config)
             output = DocumentExtractor._convert_result(result, profile)
             # Fallback: kreuzberg 4.9.1 returns page_count=0 when force_ocr=True;
             # use pypdf to get the real page count when missing.
@@ -392,7 +392,7 @@ class DocumentExtractor:
         config = DocumentExtractor._build_config(profile)
 
         try:
-            result = await _extract_bytes(data=data, mime_type=mime_type, config=config)
+            result = await _extract_bytes(data, mime_type=mime_type, config=config)
             return DocumentExtractor._convert_result(result, profile)
         except Exception:
             logger.error("Byte extraction failed for mime_type={}", mime_type)
@@ -412,13 +412,14 @@ class DocumentExtractor:
         Returns:
             List of :class:`ExtractionOutput`, one per input path.
         """
-        from kreuzberg import batch_extract_files
+        from kreuzberg import BatchFileItem, batch_extract_files
 
         profile = profile or DocumentExtractor.BASIC
         config = DocumentExtractor._build_config(profile)
 
         try:
-            results = await batch_extract_files(paths=list(file_paths), config=config)
+            items = [BatchFileItem(str(path), config=config) for path in file_paths]
+            results = await batch_extract_files(items, config=config)
             outputs = [
                 DocumentExtractor._convert_result(r, profile) for r in results
             ]
@@ -517,6 +518,14 @@ class DocumentExtractor:
     # Internal helpers -----------------------------------------------------
 
     @staticmethod
+    def _output_format(enum_cls: Any, name: str) -> Any:
+        """Return a kreuzberg OutputFormat value across API versions."""
+        try:
+            return enum_cls(name.lower())
+        except Exception:
+            return getattr(enum_cls, name.upper(), None)
+
+    @staticmethod
     def _fallback_page_count(
         file_path: Union[str, Path],
     ) -> Optional[int]:
@@ -556,12 +565,12 @@ class DocumentExtractor:
 
         # --- Output format ---
         format_map = {
-            "plain": OutputFormat.PLAIN,
-            "markdown": OutputFormat.MARKDOWN,
-            "html": OutputFormat.HTML,
-            "djot": OutputFormat.DJOT,
+            "plain": DocumentExtractor._output_format(OutputFormat, "plain"),
+            "markdown": DocumentExtractor._output_format(OutputFormat, "markdown"),
+            "html": DocumentExtractor._output_format(OutputFormat, "html"),
+            "djot": DocumentExtractor._output_format(OutputFormat, "djot"),
         }
-        output_format = format_map.get(profile.output_format, OutputFormat.PLAIN)
+        output_format = format_map.get(profile.output_format) or format_map["plain"]
 
         # --- OCR config ---
         ocr_config: Optional[OcrConfig] = None
