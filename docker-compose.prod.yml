@@ -1,0 +1,25 @@
+services:
+  medipolicyai:
+    image: medipolicyai:local
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.prod
+      args:
+        GITHUB_PROXY: ${GITHUB_PROXY:-}
+        PRELOAD_EMBEDDING_MODEL: ${PRELOAD_EMBEDDING_MODEL:-false}
+    container_name: medipolicyai
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8584}:8584"
+    env_file:
+      - ../shared/.env
+    environment:
+      SIRCHMUNK_WORK_PATH: /data/sirchmunk
+      SIRCHMUNK_SERVE_UI: "true"
+      SIRCHMUNK_PUBLIC_SERVICE: "true"
+      SIRCHMUNK_SEARCH_PATHS: /app/policy-docs
+      SIRCHMUNK_ALLOWED_PATHS: /app/policy-docs
+      EMBEDDING_CACHE_DIR: /data/sirchmunk/.cache/models
+    volumes:
+      - ../shared/data:/data/sirchmunk
+      - ../shared/policy-docs:/app/policy-docs:ro

@@ -1,0 +1,129 @@
+name: 部署到腾讯云
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-tencent-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: 构建检查
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装 Python 依赖
+        run: uv sync --extra web --extra mcp --locked
+
+      - name: Python 编译检查
+        run: uv run python -m compileall -q src
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 构建前端
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+  deploy:
+    name: 服务器本地构建并部署
+    runs-on: ubuntu-22.04
+    needs: verify
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    env:
+      TENCENT_HOST: ${{ secrets.TENCENT_HOST }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      TENCENT_USER: ${{ secrets.TENCENT_USER }}
+      TENCENT_PORT: ${{ secrets.TENCENT_PORT }}
+      TENCENT_DEPLOY_PATH: ${{ secrets.TENCENT_DEPLOY_PATH }}
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 打包源码
+        run: |
+          tar \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.sirchmunk' \
+            --exclude='.uv-cache' \
+            --exclude='graphify-out' \
+            --exclude='policy-docs' \
+            --exclude='web/node_modules' \
+            --exclude='web/.next' \
+            --exclude='web/out' \
+            -czf /tmp/medipolicyai-${GITHUB_SHA}.tar.gz .
+
+      - name: 配置 SSH
+        run: |
+          test -n "$TENCENT_HOST"
+          test -n "$SSH_PRIVATE_KEY"
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/tencent_key
+          chmod 600 ~/.ssh/tencent_key
+          REMOTE_PORT="${TENCENT_PORT:-22}"
+          ssh-keyscan -p "$REMOTE_PORT" -H "$TENCENT_HOST" >> ~/.ssh/known_hosts
+
+      - name: 上传源码包
+        run: |
+          REMOTE_USER="${TENCENT_USER:-root}"
+          REMOTE_PORT="${TENCENT_PORT:-22}"
+          scp -P "$REMOTE_PORT" -i ~/.ssh/tencent_key \
+            /tmp/medipolicyai-${GITHUB_SHA}.tar.gz \
+            "${REMOTE_USER}@${TENCENT_HOST}:/tmp/medipolicyai-${GITHUB_SHA}.tar.gz"
+
+      - name: 远程部署
+        run: |
+          REMOTE_USER="${TENCENT_USER:-root}"
+          REMOTE_PORT="${TENCENT_PORT:-22}"
+          DEPLOY_PATH="${TENCENT_DEPLOY_PATH:-/opt/medipolicyai}"
+          ssh -p "$REMOTE_PORT" -i ~/.ssh/tencent_key "${REMOTE_USER}@${TENCENT_HOST}" \
+            "DEPLOY_PATH='$DEPLOY_PATH' GITHUB_SHA='$GITHUB_SHA' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          ARCHIVE="/tmp/medipolicyai-${GITHUB_SHA}.tar.gz"
+          mkdir -p "$DEPLOY_PATH/shared/data" "$DEPLOY_PATH/shared/policy-docs" "$DEPLOY_PATH/releases"
+          rm -rf "$DEPLOY_PATH/current.new"
+          mkdir -p "$DEPLOY_PATH/current.new"
+          tar -xzf "$ARCHIVE" -C "$DEPLOY_PATH/current.new"
+
+          if [ ! -f "$DEPLOY_PATH/shared/.env" ]; then
+            cp "$DEPLOY_PATH/current.new/config/env.production.example" "$DEPLOY_PATH/shared/.env"
+            chmod 600 "$DEPLOY_PATH/shared/.env"
+            echo "[deploy] 已生成 $DEPLOY_PATH/shared/.env，请补充 LLM_API_KEY 后重新运行部署。"
+            exit 1
+          fi
+
+          rm -rf "$DEPLOY_PATH/current.prev"
+          if [ -d "$DEPLOY_PATH/current" ]; then
+            mv "$DEPLOY_PATH/current" "$DEPLOY_PATH/current.prev"
+          fi
+          mv "$DEPLOY_PATH/current.new" "$DEPLOY_PATH/current"
+          ln -sfn ../shared/.env "$DEPLOY_PATH/current/.env"
+
+          cd "$DEPLOY_PATH/current"
+          docker compose -f docker-compose.prod.yml build
+          docker compose -f docker-compose.prod.yml up -d --remove-orphans
+          docker image prune -f
+          rm -f "$ARCHIVE"
+          REMOTE

@@ -1,0 +1,103 @@
+# syntax=docker/dockerfile:1
+
+# ---------------------------------------------------------------------------
+# Stage 1: build static Web UI
+# ---------------------------------------------------------------------------
+FROM node:20-bookworm-slim AS frontend-builder
+
+WORKDIR /build/web
+
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --prefer-offline
+
+COPY web/ ./
+ENV NEXT_BUILD_STATIC=true
+ENV NEXT_PUBLIC_API_BASE=""
+RUN npm run build
+
+# ---------------------------------------------------------------------------
+# Stage 2: Python runtime
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim-bookworm AS runtime
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG GITHUB_PROXY=""
+ARG PRELOAD_EMBEDDING_MODEL=false
+
+ENV TZ=Asia/Shanghai
+ENV PYTHONUNBUFFERED=1
+ENV SIRCHMUNK_WORK_PATH=/data/sirchmunk
+ENV SIRCHMUNK_SERVE_UI=true
+ENV SIRCHMUNK_PUBLIC_SERVICE=true
+ENV SIRCHMUNK_SEARCH_PATHS=/app/policy-docs
+ENV SIRCHMUNK_ALLOWED_PATHS=/app/policy-docs
+ENV EMBEDDING_CACHE_DIR=/data/sirchmunk/.cache/models
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        ffmpeg \
+        less \
+        pandoc \
+        poppler-utils \
+        procps \
+        tesseract-ocr \
+        vim \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG RG_VERSION=14.1.1
+ARG RGA_VERSION=v0.10.10
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+        amd64) \
+            curl -fsSL "${GITHUB_PROXY}https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/ripgrep_${RG_VERSION}-1_amd64.deb" -o /tmp/rg.deb; \
+            dpkg -i /tmp/rg.deb; \
+            rm /tmp/rg.deb; \
+            rga_arch="x86_64-unknown-linux-musl" ;; \
+        arm64) \
+            curl -fsSL "${GITHUB_PROXY}https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/ripgrep-${RG_VERSION}-aarch64-unknown-linux-gnu.tar.gz" -o /tmp/rg.tar.gz; \
+            tar -xzf /tmp/rg.tar.gz -C /tmp; \
+            cp "/tmp/ripgrep-${RG_VERSION}-aarch64-unknown-linux-gnu/rg" /usr/local/bin/; \
+            rm -rf /tmp/rg.tar.gz "/tmp/ripgrep-${RG_VERSION}-aarch64-unknown-linux-gnu"; \
+            rga_arch="aarch64-unknown-linux-gnu" ;; \
+        *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "${GITHUB_PROXY}https://github.com/phiresky/ripgrep-all/releases/download/${RGA_VERSION}/ripgrep_all-${RGA_VERSION}-${rga_arch}.tar.gz" -o /tmp/rga.tar.gz; \
+    tar -xzf /tmp/rga.tar.gz -C /tmp; \
+    cp /tmp/ripgrep_all-*/rga /usr/local/bin/; \
+    cp /tmp/ripgrep_all-*/rga-preproc /usr/local/bin/; \
+    rm -rf /tmp/rga.tar.gz /tmp/ripgrep_all-*
+
+WORKDIR /app
+
+# Install uv once, then use uv for all Python dependency management.
+RUN python -m pip install --no-cache-dir uv
+
+COPY requirements/ requirements/
+RUN uv pip install --system --no-cache \
+        -r requirements/core.txt \
+        -r requirements/web.txt \
+        -r requirements/mcp.txt
+
+COPY pyproject.toml setup.py README.md ./
+COPY src/ src/
+COPY web/ web/
+COPY config/ config/
+COPY docker/entrypoint.sh /entrypoint.sh
+COPY --from=frontend-builder /build/web/out /app/web_static
+
+RUN uv pip install --system --no-cache -e ".[mcp,web]" \
+    && chmod +x /entrypoint.sh \
+    && mkdir -p /app/policy-docs /data/sirchmunk
+
+RUN if [ "$PRELOAD_EMBEDDING_MODEL" = "true" ]; then \
+      python -c "from sirchmunk.utils.embedding_util import EmbeddingUtil; EmbeddingUtil.preload_model(cache_dir='/data/sirchmunk/.cache/models')"; \
+    fi
+
+EXPOSE 8584
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["sirchmunk", "web", "serve", "--host", "0.0.0.0", "--port", "8584"]
