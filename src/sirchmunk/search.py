@@ -902,30 +902,57 @@ class AgenticSearch(BaseSearch):
         file_path: str,
         evidence: str,
         keywords: List[str],
+        evidence_by_file: Optional[List[Tuple[str, str]]] = None,
     ) -> KnowledgeCluster:
         """Build a KnowledgeCluster from FAST-mode grep evidence.
 
-        Richer than ``_make_answer_cluster``: contains a real EvidenceUnit
-        sourced from the file that was actually retrieved.
+        Richer than ``_make_answer_cluster``: contains real EvidenceUnit
+        records sourced from files that contributed evidence.
         """
         _digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:8]
-        doc_id = hashlib.sha256(file_path.encode("utf-8")).hexdigest()[:12]
+        evidence_items = evidence_by_file or [(file_path, evidence)]
+        merged_evidence: Dict[str, List[str]] = {}
+        for fp, ev in evidence_items:
+            if not fp or not ev:
+                continue
+            merged_evidence.setdefault(fp, []).append(ev)
 
-        evidence_unit = EvidenceUnit(
-            doc_id=doc_id,
-            file_or_url=file_path,
-            summary=evidence[:500] if evidence else "",
-            is_found=True,
-            snippets=[evidence[:2000]] if evidence else [],
-            extracted_at=datetime.now(timezone.utc),
-        )
+        evidences: List[EvidenceUnit] = []
+        for fp, chunks in merged_evidence.items():
+            combined = "\n\n---\n\n".join(chunks)
+            doc_id = hashlib.sha256(fp.encode("utf-8")).hexdigest()[:12]
+            evidences.append(
+                EvidenceUnit(
+                    doc_id=doc_id,
+                    file_or_url=fp,
+                    summary=combined[:500],
+                    is_found=True,
+                    snippets=[combined[:2000]],
+                    extracted_at=datetime.now(timezone.utc),
+                )
+            )
+
+        if not evidences and file_path:
+            doc_id = hashlib.sha256(file_path.encode("utf-8")).hexdigest()[:12]
+            evidences.append(
+                EvidenceUnit(
+                    doc_id=doc_id,
+                    file_or_url=file_path,
+                    summary=evidence[:500] if evidence else "",
+                    is_found=True,
+                    snippets=[evidence[:2000]] if evidence else [],
+                    extracted_at=datetime.now(timezone.utc),
+                )
+            )
+
+        search_results = [ev.file_or_url for ev in evidences]
 
         return KnowledgeCluster(
             id=f"FS{_digest}",
             name=query[:60],
             description=[f"FAST search result for: {query}"],
             content=answer,
-            evidences=[evidence_unit],
+            evidences=evidences,
             patterns=keywords[:3],
             confidence=0.7,
             abstraction_level=AbstractionLevel.TECHNIQUE,
@@ -933,8 +960,8 @@ class AgenticSearch(BaseSearch):
             hotness=0.5,
             lifecycle=Lifecycle.EMERGING,
             queries=[query],
-            search_results=[file_path],
-            resources=[{"type": "file", "value": file_path}],
+            search_results=search_results,
+            resources=[{"type": "file", "value": fp} for fp in search_results],
         )
 
     async def _search_by_filename(
@@ -2971,6 +2998,7 @@ class AgenticSearch(BaseSearch):
         best_files: Optional[List[Dict[str, Any]]] = None
         used_level = "primary"
         evidence = ""
+        evidence_by_file: List[Tuple[str, str]] = []
         file_path: Optional[str] = None  # set when best_files found
 
         # --- Pure tree search mode: skip rga, use tree probe results directly ---
@@ -3253,8 +3281,10 @@ class AgenticSearch(BaseSearch):
 
                     if ev:
                         remaining = self._FAST_MAX_EVIDENCE_CHARS - chars
-                        parts.append(ev[:remaining])
-                        chars += len(parts[-1])
+                        evidence_chunk = ev[:remaining]
+                        parts.append(evidence_chunk)
+                        evidence_by_file.append((fp, evidence_chunk))
+                        chars += len(evidence_chunk)
                         context.mark_file_read(fp)
 
                     _ev_source = "none"
@@ -3275,6 +3305,7 @@ class AgenticSearch(BaseSearch):
             evidence_parts_final: List[str] = []
             if tree_ev:
                 evidence_parts_final.append(tree_ev)
+                evidence_by_file.insert(0, (tree_nav_target, tree_ev))
             if rga_ev:
                 evidence_parts_final.append(rga_ev)
             evidence = "\n\n---\n\n".join(evidence_parts_final)
@@ -3401,6 +3432,7 @@ class AgenticSearch(BaseSearch):
 
         cluster = self._build_fast_cluster(
             query, answer, file_path or "", evidence, keywords_used,
+            evidence_by_file=evidence_by_file,
         )
         self._add_query_to_cluster(cluster, query)
         try:

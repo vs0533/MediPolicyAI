@@ -154,8 +154,13 @@ SIRCHMUNK_VERBOSE=false
 # When set, acts as the default for search(..., paths=...) if none are provided.
 SIRCHMUNK_SEARCH_PATHS=/Users/wilder/dev/MediPolicyAI/policy-docs
 
-# Maximum chat history turns for multi-turn context (0 = disabled)
-CHAT_HISTORY_MAX_TURNS=5
+# Number of candidate files to inspect for public policy Q&A RAG.
+# Lower values are faster; higher values can surface more references.
+SIRCHMUNK_RAG_TOP_K_FILES=3
+
+# Maximum chat history turns for multi-turn context (0 = disabled).
+# Public policy Q&A defaults to 0 to avoid extra LLM calls before retrieval.
+CHAT_HISTORY_MAX_TURNS=0
 
 # Maximum tokens for chat history context
 CHAT_HISTORY_MAX_TOKENS=32000

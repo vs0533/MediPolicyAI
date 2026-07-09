@@ -192,6 +192,8 @@ def _build_chat_history(
         max_turns = int(os.getenv("CHAT_HISTORY_MAX_TURNS", str(_DEFAULT_HISTORY_MAX_TURNS)))
     if not max_tokens:
         max_tokens = int(os.getenv("CHAT_HISTORY_MAX_TOKENS", str(_DEFAULT_HISTORY_MAX_TOKENS)))
+    if max_turns <= 0 or max_tokens <= 0:
+        return []
 
     raw: List[Dict[str, str]] = []
     session = chat_sessions.get(session_id)
@@ -863,12 +865,17 @@ async def _run_rag_search(
         list of evidence dicts extracted from the SearchContext cluster.
     """
     search_engine = get_search_instance(log_callback=search_log_callback)
+    try:
+        top_k_files = int(os.getenv("SIRCHMUNK_RAG_TOP_K_FILES", "3"))
+    except ValueError:
+        top_k_files = 3
+    top_k_files = max(1, min(top_k_files, 10))
 
     result = await search_engine.search(
         query=message,
         paths=paths,
         mode=search_mode,
-        top_k_files=3,
+        top_k_files=top_k_files,
         return_context=True,
     )
 
