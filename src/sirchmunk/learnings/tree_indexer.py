@@ -22,7 +22,10 @@ from sirchmunk.utils import LogCallback, create_logger
 from sirchmunk.utils.file_utils import get_fast_hash
 
 # File-size threshold: skip tree indexing for small files
-_TREE_MIN_CHARS = 10_000  # 10 K characters (lowered from 20K for broader coverage)
+# ponytail: 从 10K 降到 5K，让中小型协议文档（如"互联网+"协议、长期护理评估协议）
+# 也能建 tree。否则它们走 rga 全文 grep，召回相关性差（实测案例：异地就医条款被漏）。
+# 已有文档需删 manifest 条目后重新 compile 才生效（增量 compile 会跳过 hash 未变文件）。
+_TREE_MIN_CHARS = 5_000
 
 # Adaptive depth thresholds: (min_chars, max_depth) — evaluated top-down;
 # **must** be sorted by min_chars descending so the first match wins.
