@@ -10,7 +10,10 @@ import "katex/dist/katex.min.css";
 import {
   Bot,
   BookOpen,
+  CheckCircle2,
+  ChevronDown,
   FileText,
+  FileSearch,
   Loader2,
   Plus,
   Send,
@@ -192,6 +195,9 @@ export default function HomePage() {
                       </div>
                     )}
                   </div>
+                  {msg.role === "assistant" && (msg.searchLogs?.length || msg.isStreaming) && (
+                    <SearchProcessPanel logs={msg.searchLogs || []} isActive={Boolean(msg.isStreaming)} />
+                  )}
                   {msg.role === "assistant" &&
                     msg.sources?.references &&
                     msg.sources.references.length > 0 && (
@@ -272,6 +278,131 @@ export default function HomePage() {
       )}
     </div>
   );
+}
+
+function SearchProcessPanel({
+  logs,
+  isActive,
+}: {
+  logs: Array<{
+    level: string;
+    message: string;
+    timestamp: string;
+    is_streaming?: boolean;
+    task_id?: string;
+    flush?: boolean;
+  }>;
+  isActive: boolean;
+}) {
+  const visibleLogs = buildPublicSearchLogs(logs, isActive);
+
+  if (visibleLogs.length === 0 && !isActive) return null;
+
+  return (
+    <details
+      open={isActive}
+      className="mt-2 rounded-lg border border-teal-100 dark:border-teal-800 bg-teal-50/60 dark:bg-teal-950/20"
+    >
+      <summary className="flex items-center justify-between gap-3 px-3 py-2 cursor-pointer text-xs font-medium text-teal-700 dark:text-teal-300">
+        <span className="flex items-center gap-2">
+          {isActive ? (
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+          ) : (
+            <CheckCircle2 className="w-3.5 h-3.5" />
+          )}
+          检索过程
+        </span>
+        <ChevronDown className="w-3.5 h-3.5" />
+      </summary>
+      <div className="px-3 pb-3 space-y-2">
+        {visibleLogs.map((log, index) => (
+          <div key={`${log}-${index}`} className="flex items-start gap-2 text-xs text-slate-600 dark:text-slate-300">
+            <FileSearch className="w-3.5 h-3.5 mt-0.5 text-teal-500 shrink-0" />
+            <span className="leading-relaxed">{log}</span>
+          </div>
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function buildPublicSearchLogs(
+  logs: Array<{ level: string; message: string }>,
+  isActive: boolean,
+) {
+  const items: string[] = [];
+  const seen = new Set<string>();
+
+  const push = (value: string) => {
+    const text = value.trim();
+    if (!text || seen.has(text)) return;
+    seen.add(text);
+    items.push(text);
+  };
+
+  if (isActive || logs.length > 0) {
+    push("正在分析问题并检索医保政策知识库");
+  }
+
+  for (const log of logs) {
+    const raw = sanitizeSearchLog(log.message);
+    if (!raw) continue;
+
+    if (raw.includes("[FAST:Step1] Primary")) {
+      push("已提取检索关键词");
+      continue;
+    }
+    if (raw.includes("[FAST:Step2] Best file")) {
+      const file = extractDisplayFileName(raw);
+      push(file ? `已找到候选文件：${file}` : "已找到候选政策文件");
+      push("正在校验候选依据是否足够回答");
+      continue;
+    }
+    if (raw.includes("[FAST:Step3] Evidence")) {
+      const chars = raw.match(/Evidence:\s*(\d+)\s*chars/i)?.[1];
+      push(chars ? `已抽取政策依据片段（约 ${chars} 字符）` : "已抽取政策依据片段");
+      continue;
+    }
+    if (raw.includes("[FAST:Step4]") || raw.includes("Generating")) {
+      push("正在依据检索结果生成回答");
+      continue;
+    }
+    if (
+      raw.includes("Evidence acceptance: False") ||
+      raw.includes("Evidence rejected after retry") ||
+      raw.includes("Candidate files were found")
+    ) {
+      push("候选文件中找到相关片段，但不足以支撑该问题的明确答案");
+      continue;
+    }
+    if (raw.includes("Search complete") || raw.includes("Knowledge base search completed")) {
+      push("知识库检索完成");
+      continue;
+    }
+    if (log.level === "error" || raw.includes("failed")) {
+      push("检索过程中出现异常，已尝试降级处理");
+    }
+  }
+
+  if (!isActive && logs.length > 0) {
+    push("回答已生成");
+  }
+
+  return items.slice(-8);
+}
+
+function sanitizeSearchLog(message: string) {
+  return (message || "")
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/\[role=assistant\][\s\S]*/gi, "")
+    .replace(/\/Users\/[^\s,'")\]]+/g, "政策知识库")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractDisplayFileName(message: string) {
+  const match = message.match(/Best file \([^)]+\):\s*(.*?)\s*\(/);
+  return match?.[1]?.trim();
 }
 
 function QuestionInput({

@@ -981,8 +981,8 @@ async def _chat_rag(
 
             if str(search_result).strip() == "No results found.":
                 response = (
-                    "医保政策知识库中未检索到足够相关的依据。"
-                    "请换一种问法，或补充政策文件后再查询。"
+                    "医保政策知识库中找到了相关候选片段，但不足以支撑该问题的明确答案。"
+                    "请换一种更具体的问法，或补充包含办理流程的政策文件后再查询。"
                 )
                 return response, sources
 
