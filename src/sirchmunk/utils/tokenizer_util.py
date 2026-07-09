@@ -1,5 +1,30 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import List, Optional, Union
+import threading
+from typing import Any, Dict, List, Optional, Union
+
+
+# ponytail: tokenizer 进程内单例缓存。
+# AutoTokenizer.from_pretrained 每次调用都会让 modelscope 联网校验文件清单
+# （日志里的 "Downloading 8 files"），而请求热路径每次都 new TokenizerUtil，
+# 导致每问一次问题都重复校验。这里按 model_id 缓存实例，进程内只加载一次。
+_TOKENIZER_LOCK = threading.Lock()
+_tokenizer_cache: Dict[str, Any] = {}
+
+
+def _get_tokenizer(model_id: str) -> Any:
+    """按 model_id 返回进程内单例 tokenizer（线程安全）。"""
+    cached = _tokenizer_cache.get(model_id)
+    if cached is not None:
+        return cached
+    with _TOKENIZER_LOCK:
+        cached = _tokenizer_cache.get(model_id)
+        if cached is not None:
+            return cached
+        from modelscope import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        _tokenizer_cache[model_id] = tokenizer
+        return tokenizer
 
 
 class TokenizerUtil:
@@ -11,10 +36,9 @@ class TokenizerUtil:
         Args:
             model_id: Model ID for loading the tokenizer. Defaults to "Qwen/Qwen3-8B".
         """
-        from modelscope import AutoTokenizer
-
-        model_id: str = model_id or "Qwen/Qwen3-8B"
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        model_id = model_id or "Qwen/Qwen3-8B"
+        # 复用进程内单例，避免每次实例化都触发 modelscope 联网校验。
+        self.tokenizer = _get_tokenizer(model_id)
 
     def encode(self, content: str) -> List[int]:
         """Encode text into token IDs.
@@ -56,7 +80,6 @@ class TokenizerUtil:
         """
         if not content.strip():
             return []
-
         token_ids = self.encode(content)
         # Decode each token ID individually to get its string representation
         token_strings = [
