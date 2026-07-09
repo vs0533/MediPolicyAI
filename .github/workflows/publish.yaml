@@ -3,7 +3,8 @@ name: release
 on:
   push:
     tags:
-      - 'v*.*.*'
+      - 'pypi-v*.*.*'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-publish
