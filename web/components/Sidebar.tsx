@@ -6,17 +6,12 @@ import Image from "next/image";
 import { usePathname } from "next/navigation";
 import {
   Home,
-  History,
-  BookOpen,
-  Settings,
   ChevronsLeft,
   ChevronsRight,
-  Monitor,
-  Globe,
-  Github,
 } from "lucide-react";
 import { useGlobal } from "@/context/GlobalContext";
 import { getTranslation, type Language } from "@/lib/i18n";
+import { APP_NAME, APP_SUBTITLE } from "@/lib/public-service";
 
 const SIDEBAR_EXPANDED_WIDTH = 256;
 const SIDEBAR_COLLAPSED_WIDTH = 64;
@@ -39,14 +34,6 @@ export default function Sidebar() {
       name: "",
       items: [
         { name: t("Home"), href: "/", icon: Home },
-        { name: t("History"), href: "/history", icon: History },
-        { name: t("Knowledge"), href: "/knowledge", icon: BookOpen },
-      ],
-    },
-    {
-      name: t("Dashboard"),
-      items: [
-        { name: t("Monitor"), href: "/monitor", icon: Monitor },
       ],
     },
   ];
@@ -66,8 +53,8 @@ export default function Sidebar() {
         <div className="px-2 py-3 border-b border-slate-100 dark:border-slate-700 flex justify-center">
           <div className="w-8 h-8 rounded-lg flex items-center justify-center overflow-hidden">
             <Image
-              src="/logo-v2.png"
-                  alt="Sirchmunk Logo"
+              src="/logo.svg"
+              alt={`${APP_NAME} Logo`}
               width={32}
               height={32}
               className="object-contain"
@@ -121,30 +108,6 @@ export default function Sidebar() {
         {/* Footer */}
         <div className="px-2 py-2 border-t border-slate-100 dark:border-slate-700 bg-slate-50/30 dark:bg-slate-800/30">
           <div className="relative">
-            <Link
-              href="/settings"
-              className={`flex items-center justify-center p-2 rounded-md ${
-                pathname === "/settings"
-                  ? "bg-white dark:bg-slate-700 text-blue-600 dark:text-blue-400 shadow-sm border border-slate-100 dark:border-slate-600"
-                  : "text-slate-600 dark:text-slate-300 hover:bg-white dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-100"
-              }`}
-              onMouseEnter={() => setShowTooltip("/settings")}
-              onMouseLeave={() => setShowTooltip(null)}
-            >
-              <Settings
-                className={`w-5 h-5 flex-shrink-0 ${
-                  pathname === "/settings"
-                    ? "text-blue-500 dark:text-blue-400"
-                    : "text-slate-400 dark:text-slate-500"
-                }`}
-              />
-            </Link>
-            {showTooltip === "/settings" && (
-              <div className="absolute left-full ml-2 top-1/2 -translate-y-1/2 z-50 px-2.5 py-1.5 bg-slate-900 dark:bg-slate-700 text-white text-xs rounded-lg shadow-lg whitespace-nowrap pointer-events-none">
-                {t("Settings")}
-                <div className="absolute right-full top-1/2 -translate-y-1/2 border-4 border-transparent border-r-slate-900 dark:border-r-slate-700" />
-              </div>
-            )}
           </div>
 
           {/* Expand button at bottom */}
@@ -173,8 +136,8 @@ export default function Sidebar() {
             <div className="flex items-center gap-2.5">
               <div className="w-8 h-8 rounded-lg flex items-center justify-center overflow-hidden">
                 <Image
-                  src="/logo-v2.png"
-                  alt="Sirchmunk Logo"
+                  src="/logo.svg"
+                  alt={`${APP_NAME} Logo`}
                   width={32}
                   height={32}
                   className="object-contain"
@@ -182,7 +145,7 @@ export default function Sidebar() {
                 />
               </div>
               <h1 className="font-bold text-slate-900 dark:text-slate-100 tracking-tight text-base truncate">
-                Sirchmunk
+                {APP_NAME}
               </h1>
             </div>
             <div className="flex items-center gap-0.5">
@@ -194,29 +157,11 @@ export default function Sidebar() {
               >
                 <ChevronsLeft className="w-4 h-4" />
               </button>
-              <a
-                href="https://modelscope.github.io/sirchmunk-web"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-slate-400 hover:text-blue-500 dark:hover:text-blue-400 p-1.5 hover:bg-slate-100 dark:hover:bg-slate-700 rounded"
-                title="Visit Sirchmunk Homepage"
-              >
-                <Globe className="w-4 h-4" />
-              </a>
-              <a
-                href="https://github.com/modelscope/sirchmunk"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-slate-400 hover:text-slate-800 dark:hover:text-slate-200 p-1.5 hover:bg-slate-100 dark:hover:bg-slate-700 rounded"
-                title="View on GitHub"
-              >
-                <Github className="w-4 h-4" />
-              </a>
             </div>
           </div>
 
           <div className="text-[10px] font-medium text-slate-500 dark:text-slate-400 bg-slate-100/50 dark:bg-slate-700/50 px-2 py-1.5 rounded-md border border-slate-100 dark:border-slate-600 truncate">
-            ✨ ModelScope Team
+            {APP_SUBTITLE}
           </div>
         </div>
       </div>
@@ -261,26 +206,6 @@ export default function Sidebar() {
         ))}
       </nav>
 
-      {/* Footer */}
-      <div className="px-3 py-2 border-t border-slate-100 dark:border-slate-700 bg-slate-50/30 dark:bg-slate-800/30">
-        <Link
-          href="/settings"
-          className={`w-full flex items-center gap-2.5 px-3 py-1.5 rounded-md text-sm ${
-            pathname === "/settings"
-              ? "bg-white dark:bg-slate-700 text-blue-600 dark:text-blue-400 shadow-sm border border-slate-100 dark:border-slate-600"
-              : "text-slate-600 dark:text-slate-300 hover:bg-white dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-100"
-          }`}
-        >
-          <Settings
-            className={`w-4 h-4 flex-shrink-0 ${
-              pathname === "/settings"
-                ? "text-blue-500 dark:text-blue-400"
-                : "text-slate-400 dark:text-slate-500"
-            }`}
-          />
-          <span>{t("Settings")}</span>
-        </Link>
-      </div>
     </div>
   );
 }

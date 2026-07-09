@@ -32,7 +32,9 @@ from sirchmunk.api.security import (
     validate_user_path,
     file_browser_limiter,
     audit_logger,
+    is_public_service_mode,
 )
+from sirchmunk.utils.utils import extract_fields
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +88,7 @@ def _resolve_rag_paths(kb_name: str) -> Tuple[List[str], str]:
     def _parse(s: str) -> List[str]:
         return [p.strip() for p in (s or "").split(",") if p.strip()]
 
-    if kb_name and _parse(kb_name):
+    if not is_public_service_mode() and kb_name and _parse(kb_name):
         raw_paths = _parse(kb_name)
         validated: List[str] = []
         for rp in raw_paths:
@@ -116,6 +118,58 @@ _DEFAULT_HISTORY_MAX_TOKENS = 32000
 def _estimate_tokens(text: str) -> int:
     """Rough token estimate for mixed CJK / Latin text (~3.5 chars per token)."""
     return max(1, int(len(text) / 3.5))
+
+
+def _strip_thinking_content(text: str) -> str:
+    """Remove provider thinking blocks from model output."""
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.IGNORECASE | re.DOTALL)
+    return text.strip()
+
+
+def _extract_query_text(text: str, fallback: str) -> str:
+    """Extract a single search query from model output."""
+    cleaned = _strip_thinking_content(text).strip().strip("`").strip()
+    if not cleaned:
+        return fallback
+    lines = [line.strip().strip('"').strip("'") for line in cleaned.splitlines() if line.strip()]
+    return lines[-1] if lines else fallback
+
+
+def _clean_tagged_answer_text(text: str) -> str:
+    """Remove model control markup from user-visible answers."""
+    cleaned = _strip_thinking_content(text or "")
+    fields = extract_fields(
+        content=cleaned,
+        tags=["PRECISE_ANSWER", "SUMMARY"],
+    )
+    precise = str(fields.get("precise_answer") or "").strip()
+    summary = str(fields.get("summary") or "").strip()
+
+    concise_match = re.fullmatch(
+        r'\[concise answer:\s*["“](.*?)["”]\]',
+        precise,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if concise_match:
+        precise = concise_match.group(1).strip()
+
+    if precise and summary:
+        cleaned = f"**答案：** {precise}\n\n{summary}"
+    elif precise:
+        cleaned = precise
+    elif summary:
+        cleaned = summary
+
+    cleaned = re.sub(
+        r"</?(?:SUMMARY|PRECISE_ANSWER|SHOULD_ANSWER|SHOULD_SAVE)>",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\[content\]", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\*\*Answer:\s*(.*?)\*\*", r"**答案：** \1", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def _build_chat_history(
@@ -183,7 +237,7 @@ async def _rewrite_query_with_context(
         messages=[{"role": "user", "content": prompt}],
         stream=False,
     )
-    rewritten = (resp.content or message).strip()
+    rewritten = _extract_query_text(resp.content or "", message)
     if not rewritten:
         return message
     if rewritten != message:
@@ -217,7 +271,7 @@ async def _filter_relevant_history(
             messages=[{"role": "user", "content": prompt}],
             stream=False,
         )
-        text = (resp.content or "").strip()
+        text = _strip_thinking_content(resp.content or "")
         match = re.search(r'"relevant"\s*:\s*(true|false)', text, re.IGNORECASE)
         if match and match.group(1).lower() == "false":
             logger.info(
@@ -289,7 +343,11 @@ class ChatConnectionManager:
             self.active_connections.remove(websocket)
 
     async def send_personal_message(self, message: str, websocket: WebSocket):
-        await websocket.send_text(message)
+        try:
+            await websocket.send_text(message)
+        except (RuntimeError, WebSocketDisconnect):
+            self.disconnect(websocket)
+            logger.debug("WebSocket already closed; skipped outgoing message")
 
 # Unified log callback management
 class WebSocketLogger:
@@ -865,6 +923,21 @@ async def _chat_rag(
         response = "Please specify search paths for RAG search."
         return response, sources
 
+    inaccessible_paths = [
+        path for path in paths
+        if not os.path.isdir(path) or not os.access(path, os.R_OK | os.X_OK)
+    ]
+    if inaccessible_paths:
+        message_text = (
+            "政策知识库目录当前不可访问。请给服务进程授予 Documents 目录访问权限，"
+            "或将医保政策文档移动到项目可读目录后更新 SIRCHMUNK_SEARCH_PATHS。"
+        )
+        await manager.send_personal_message(json.dumps({
+            "type": "error",
+            "message": message_text,
+        }, ensure_ascii=False), websocket)
+        return message_text, sources
+
     # Multi-turn: rewrite the query so it is self-contained for retrieval
     search_query = message
     if history:
@@ -898,6 +971,13 @@ async def _chat_rag(
                 "type": "search_complete",
                 "message": "✅ Knowledge base search completed"
             }), websocket)
+
+            if str(search_result).strip() == "No results found.":
+                response = (
+                    "医保政策知识库中未检索到足够相关的依据。"
+                    "请换一种问法，或补充政策文件后再查询。"
+                )
+                return response, sources
 
             sources["rag"] = [{
                 "kb_name": paths_display,
@@ -1185,19 +1265,10 @@ async def chat_websocket(websocket: WebSocket):
             
             # Update session with new message
             session = chat_sessions[session_id]
-            user_message = {
-                "role": "user",
-                "content": message,
-                "timestamp": datetime.now().isoformat()
-            }
-            session["messages"].append(user_message)
-            session["updated_at"] = datetime.now().isoformat()
-            
-            # Save user message to persistent storage
-            history_storage.save_message(session_id, user_message)
-            
+
             # ============================================================
-            # Build conversation history for multi-turn support
+            # Build conversation history for multi-turn support before
+            # appending the current user message.
             # ============================================================
             chat_history = _build_chat_history(session_id)
 
@@ -1209,6 +1280,17 @@ async def chat_websocket(websocket: WebSocket):
                     model=envs_for_filter["model_name"],
                 )
                 chat_history = await _filter_relevant_history(message, chat_history, filter_llm)
+
+            user_message = {
+                "role": "user",
+                "content": message,
+                "timestamp": datetime.now().isoformat()
+            }
+            session["messages"].append(user_message)
+            session["updated_at"] = datetime.now().isoformat()
+            
+            # Save user message to persistent storage
+            history_storage.save_message(session_id, user_message)
 
             # ============================================================
             # Route to appropriate chat mode based on feature flags
@@ -1241,6 +1323,8 @@ async def chat_websocket(websocket: WebSocket):
                 response, sources = await _chat_only(
                     message, websocket, manager, history=chat_history,
                 )
+
+            response = _clean_tagged_answer_text(response)
             
             # ============================================================
             # Stream response to client
@@ -1286,7 +1370,7 @@ async def chat_websocket(websocket: WebSocket):
             # Update session in persistent storage
             history_storage.save_session(session)
             
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         manager.disconnect(websocket)
     except Exception as e:
         logger.error("WebSocket error occurred")

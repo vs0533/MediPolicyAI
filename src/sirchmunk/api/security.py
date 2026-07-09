@@ -30,6 +30,16 @@ def _get_api_token() -> Optional[str]:
     return token or None
 
 
+def is_public_service_mode() -> bool:
+    """Return True when the API should expose only public Q&A surfaces."""
+    return os.getenv("SIRCHMUNK_PUBLIC_SERVICE", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
 async def verify_token(request: Request) -> None:
     """Verify Bearer token. No-op when SIRCHMUNK_API_TOKEN is unset."""
     token = _get_api_token()

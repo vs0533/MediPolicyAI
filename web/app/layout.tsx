@@ -21,8 +21,8 @@ const font = localFont({
 });
 
 export const metadata: Metadata = {
-  title: "Sirchmunk Platform",
-  description: "Multi-Agent Teaching & Research Copilot",
+  title: "政策问答",
+  description: "医保政策公共问答服务",
 };
 
 export default function RootLayout({

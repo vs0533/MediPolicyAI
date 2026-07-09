@@ -40,12 +40,12 @@ if _env_file.exists():
 
 import logging
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.responses import FileResponse, Response
 
-from .security import SecurityHeadersMiddleware, verify_token
+from .security import SecurityHeadersMiddleware, is_public_service_mode, verify_token
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +68,8 @@ _ui_available = _serve_ui and _static_dir.is_dir() and (_static_dir / "index.htm
 _debug = os.getenv("SIRCHMUNK_DEBUG", "false").lower() == "true"
 
 app = FastAPI(
-    title="Sirchmunk API",
-    description="APIs for Sirchmunk",
+    title="政策问答 API",
+    description="医保政策公共问答服务 API",
     version="1.0.0",
     docs_url="/docs" if _debug else None,
     redoc_url="/redoc" if _debug else None,
@@ -96,6 +96,32 @@ app.add_middleware(SecurityHeadersMiddleware)
 async def auth_middleware(request: Request, call_next):
     """Enforce Bearer-token auth on /api/ routes when SIRCHMUNK_API_TOKEN is set."""
     path = request.url.path
+    if is_public_service_mode() and path.startswith("/api/"):
+        public_allowed = path == "/api/v1/settings/ui"
+        blocked_prefixes = (
+            "/api/v1/settings",
+            "/api/v1/monitor",
+            "/api/v1/knowledge",
+            "/api/v1/files",
+            "/api/v1/file-picker",
+            "/api/v1/file-browser",
+            "/api/v1/search",
+            "/api/v1/history",
+            "/api/v1/dashboard",
+            "/api/v1/chat/sessions",
+        )
+        if not public_allowed and any(path.startswith(prefix) for prefix in blocked_prefixes):
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "success": False,
+                    "error": {
+                        "code": "PUBLIC_SERVICE_FORBIDDEN",
+                        "message": "This public service endpoint is not available.",
+                    },
+                },
+            )
+
     # Exempt: health check, favicon, static assets, OPTIONS preflight, UI settings
     exempt = (
         path in ("/health", "/favicon.ico")
@@ -138,9 +164,9 @@ if not _ui_available:
     async def root():
         """Root endpoint with API information"""
         return {
-            "name": "Sirchmunk API",
+            "name": "政策问答 API",
             "version": "1.0.0",
-            "description": "APIs for Sirchmunk",
+            "description": "医保政策公共问答服务 API",
             "status": "running",
             "endpoints": {
                 "search": "/api/v1/search",

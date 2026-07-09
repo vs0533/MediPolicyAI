@@ -1,70 +1,32 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
-import {
-  Send,
-  Loader2,
-  Bot,
-  User,
-  Database,
-  Globe,
-  Calculator,
-  FileText,
-  Microscope,
-  Lightbulb,
-  Trash2,
-  ExternalLink,
-  BookOpen,
-  Sparkles,
-  Edit3,
-  GraduationCap,
-  PenTool,
-  Search,
-  ChevronDown,
-  Folder,
-  Plus,
-  Square,
-  Zap,
-} from "lucide-react";
-import Link from "next/link";
+import { useEffect, useRef, useState } from "react";
+import type { KeyboardEvent, RefObject } from "react";
 import Image from "next/image";
 import ReactMarkdown from "react-markdown";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import "katex/dist/katex.min.css";
+import {
+  Bot,
+  BookOpen,
+  FileText,
+  Loader2,
+  Plus,
+  Send,
+  ShieldCheck,
+  Square,
+  Trash2,
+  User,
+} from "lucide-react";
 import { useGlobal } from "@/context/GlobalContext";
-import { apiUrl, getAuthHeaders } from "@/lib/api";
 import { processLatexContent } from "@/lib/latex";
-import { getTranslation, type Language } from "@/lib/i18n";
-import FileBrowser from "@/components/FileBrowser";
-import FileUpload from "@/components/FileUpload";
-import CollectionBrowser from "../components/CollectionBrowser";
-
-interface KnowledgeBase {
-  name: string;
-  is_default?: boolean;
-}
-
-interface SearchSuggestion {
-  filename: string;
-  display_name: string;
-  type: string;
-  size: string;
-  kb_name: string;
-  highlight_start: number;
-  highlight_end: number;
-}
-
-interface ChatState {
-  sessionId: string | null;
-  messages: any[];
-  isLoading: boolean;
-  selectedKb: string;
-  enableRag: boolean;
-  enableWebSearch: boolean;
-  searchMode: string;
-  currentStage: string | null;
-}
+import {
+  APP_NAME,
+  APP_SUBTITLE,
+  POLICY_KNOWLEDGE_LABEL,
+  POLICY_KNOWLEDGE_PATH,
+} from "@/lib/public-service";
 
 export default function HomePage() {
   const {
@@ -73,1360 +35,294 @@ export default function HomePage() {
     sendChatMessage,
     stopChatMessage,
     newChatSession,
-    settings,
+    clearChatHistory,
   } = useGlobal();
-  const t = (key: string) => getTranslation((settings?.language as Language) || "en", key);
-
-
   const [inputMessage, setInputMessage] = useState("");
-  const [kbs, setKbs] = useState<KnowledgeBase[]>([]);
-  const [searchSuggestions, setSearchSuggestions] = useState<SearchSuggestion[]>([]);
-  const [showSuggestions, setShowSuggestions] = useState(false);
-  const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState(-1);
-  const [showFileSelector, setShowFileSelector] = useState(false);
-  const [fileBrowserMode, setFileBrowserMode] = useState<"files" | "directory" | null>(null);
-  const [tkinterAvailable, setTkinterAvailable] = useState<boolean | null>(null);
-  const [selectedPath, setSelectedPath] = useState<string>("");
-  const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
-  const [showPathDropdown, setShowPathDropdown] = useState(false);
-  const [showModeDropdown, setShowModeDropdown] = useState(false);
-  const [enableSuggestions, setEnableSuggestions] = useState(true);
-  const [showUpload, setShowUpload] = useState(false);
-  const [showCollectionBrowser, setShowCollectionBrowser] = useState(false);
-  const [manualPath, setManualPath] = useState("");
-  const [pathError, setPathError] = useState<string | null>(null);
-  const chatEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const suggestionsRef = useRef<HTMLDivElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const pathDropdownRef = useRef<HTMLDivElement>(null);
-  const modeDropdownRef = useRef<HTMLDivElement>(null);
 
-  // Fetch knowledge bases
   useEffect(() => {
-    fetch(apiUrl("/api/v1/knowledge/list"), { headers: { ...getAuthHeaders() } })
-      .then((res) => res.json())
-      .then((response) => {
-        // Handle API response structure
-        const data = response.data || response;
-        const kbList = Array.isArray(data) ? data : [];
-        setKbs(kbList);
-        if (!chatState.selectedKb && kbList.length > 0) {
-          const defaultKb = kbList.find((kb: KnowledgeBase) => kb.is_default);
-          if (defaultKb) {
-            setChatState((prev: ChatState) => ({ ...prev, selectedKb: defaultKb.name }));
-          } else {
-            setChatState((prev: ChatState) => ({ ...prev, selectedKb: kbList[0].name }));
-          }
-        }
-      })
-      .catch((err) => console.error("Failed to fetch KBs:", err));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    setChatState((prev) => ({
+      ...prev,
+      enableRag: true,
+      enableWebSearch: false,
+      selectedKb: POLICY_KNOWLEDGE_PATH,
+      searchMode: "FAST",
+    }));
+  }, [setChatState]);
 
-  // Sync file selector with SIRCHMUNK_SEARCH_PATHS from .env
-  useEffect(() => {
-    fetch(apiUrl("/api/v1/settings/environment"), { headers: { ...getAuthHeaders() } })
-      .then((res) => res.json())
-      .then((result) => {
-        if (result.success && result.data?.SIRCHMUNK_SEARCH_PATHS) {
-          const envValue = result.data.SIRCHMUNK_SEARCH_PATHS.value;
-          if (envValue && envValue.trim()) {
-            const envPaths = envValue
-              .split(",")
-              .map((p: string) => p.trim())
-              .filter((p: string) => p.length > 0);
-            if (envPaths.length > 0 && selectedPaths.length === 0) {
-              setSelectedPaths(envPaths);
-              setSelectedPath(envPaths[0]);
-              setChatState((prev) => ({
-                ...prev,
-                enableRag: true,
-                selectedKb: envPaths.join(","),
-              }));
-            }
-          }
-        }
-      })
-      .catch((err) => console.error("Failed to fetch SIRCHMUNK_SEARCH_PATHS:", err));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Check if Tkinter file picker is available (will be false in Docker)
-  useEffect(() => {
-    fetch(apiUrl("/api/v1/file-picker/status"), { headers: { ...getAuthHeaders() } })
-      .then((res) => res.json())
-      .then((result) => {
-        if (result.success) {
-          setTkinterAvailable(result.data.tkinter_available);
-        }
-      })
-      .catch(() => setTkinterAvailable(false));
-  }, []);
-
-  // Auto-scroll to bottom when new messages or log output arrives.
-  // Run after layout (rAF) so we scroll to the actual bottom; only scroll when
-  // user is already near bottom or when loading, to avoid pulling view to blank.
   useEffect(() => {
     const el = messagesContainerRef.current;
     if (!el) return;
     const { scrollTop, scrollHeight, clientHeight } = el;
     const nearBottom = scrollHeight - scrollTop - clientHeight < 200;
     if (!nearBottom && !chatState.isLoading) return;
-
-    const id = requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        if (messagesContainerRef.current) {
-          messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
-        }
-      });
+    requestAnimationFrame(() => {
+      if (messagesContainerRef.current) {
+        messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
+      }
     });
-    return () => cancelAnimationFrame(id);
   }, [chatState.messages, chatState.isLoading]);
 
-  const handleSend = async () => {
-    if (!inputMessage.trim() || chatState.isLoading) return;
-
-    // Check for Google search shortcut
-    const trimmedMessage = inputMessage.trim();
-    if (trimmedMessage.toLowerCase().startsWith('g:') || trimmedMessage.toLowerCase().startsWith('G:')) {
-      const searchQuery = trimmedMessage.slice(2).trim();
-      if (searchQuery) {
-        // Open Google search in new tab
-        window.open(`https://www.google.com/search?q=${encodeURIComponent(searchQuery)}`, '_blank');
-      } else {
-        // Open Google homepage if no query
-        window.open('https://www.google.com', '_blank');
-      }
-      setInputMessage("");
-      return;
-    }
-
-    // Check if File search is enabled and we have selected paths
-    if (chatState.enableRag && selectedPaths.length > 0) {
-      // Use WebSocket chat with search paths instead of direct REST API
-      setChatState((prev) => ({
-        ...prev,
-        selectedKb: selectedPaths.join(","), // Pass paths as comma-separated string
-      }));
-    }
-
-    sendChatMessage(inputMessage);
+  const handleSend = () => {
+    const message = inputMessage.trim();
+    if (!message || chatState.isLoading) return;
+    sendChatMessage(message);
     setInputMessage("");
   };
 
-  // Fetch search suggestions
-  const fetchSearchSuggestions = async (query: string) => {
-    if (!enableSuggestions || !chatState.enableRag || !chatState.selectedKb || query.length < 2) {
-      setSearchSuggestions([]);
-      setShowSuggestions(false);
-      return;
-    }
-
-    try {
-      const response = await fetch(
-        apiUrl(`/api/v1/search/suggestions?kb_name=${encodeURIComponent(chatState.selectedKb)}&query=${encodeURIComponent(query)}&limit=8`),
-        { headers: { ...getAuthHeaders() } }
-      );
-      if (!response.ok) {
-        setSearchSuggestions([]);
-        setShowSuggestions(false);
-        return;
-      }
-      const result = await response.json();
-      if (result.success) {
-        setSearchSuggestions(result.data);
-        setShowSuggestions(result.data.length > 0);
-        setSelectedSuggestionIndex(-1);
-      }
-    } catch (error) {
-      console.error("Failed to fetch suggestions:", error);
-      setSearchSuggestions([]);
-      setShowSuggestions(false);
+  const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.nativeEvent.isComposing || event.key === "Process") return;
+    if (event.key === "Enter") {
+      event.preventDefault();
+      handleSend();
     }
   };
-
-  // Debounced search suggestions
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      fetchSearchSuggestions(inputMessage);
-    }, 200);
-    return () => clearTimeout(timer);
-  }, [inputMessage, chatState.enableRag, chatState.selectedKb, enableSuggestions]);
-
-  // Click outside to close suggestions and dropdown
-  useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
-      if (
-        suggestionsRef.current &&
-        !suggestionsRef.current.contains(event.target as Node) &&
-        inputRef.current &&
-        !inputRef.current.contains(event.target as Node)
-      ) {
-        setShowSuggestions(false);
-        setSelectedSuggestionIndex(-1);
-      }
-
-      if (
-        pathDropdownRef.current &&
-        !pathDropdownRef.current.contains(event.target as Node) &&
-        !(event.target as Element).closest('button')?.textContent?.includes('Select Path')
-      ) {
-        setShowPathDropdown(false);
-      }
-
-      if (
-        modeDropdownRef.current &&
-        !modeDropdownRef.current.contains(event.target as Node)
-      ) {
-        setShowModeDropdown(false);
-      }
-    };
-
-    if (showSuggestions || showPathDropdown || showModeDropdown) {
-      document.addEventListener('mousedown', handleClickOutside);
-      return () => document.removeEventListener('mousedown', handleClickOutside);
-    }
-  }, [showSuggestions, showPathDropdown, showModeDropdown]);
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.nativeEvent.isComposing || e.key === "Process") {
-      return;
-    }
-    if (showSuggestions && searchSuggestions.length > 0) {
-      if (e.key === "ArrowDown") {
-        e.preventDefault();
-        setSelectedSuggestionIndex(prev =>
-          prev < searchSuggestions.length - 1 ? prev + 1 : 0
-        );
-      } else if (e.key === "ArrowUp") {
-        e.preventDefault();
-        setSelectedSuggestionIndex(prev =>
-          prev > 0 ? prev - 1 : searchSuggestions.length - 1
-        );
-      } else if (e.key === "Tab" && selectedSuggestionIndex >= 0) {
-        e.preventDefault();
-        const suggestion = searchSuggestions[selectedSuggestionIndex];
-        setInputMessage(`Search in ${suggestion.filename}: `);
-        setShowSuggestions(false);
-        setSelectedSuggestionIndex(-1);
-      } else if (e.key === "Escape") {
-        setShowSuggestions(false);
-        setSelectedSuggestionIndex(-1);
-      }
-    }
-
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      if (showSuggestions && selectedSuggestionIndex >= 0) {
-        const suggestion = searchSuggestions[selectedSuggestionIndex];
-        setInputMessage(`Search in ${suggestion.filename}: `);
-        setShowSuggestions(false);
-        setSelectedSuggestionIndex(-1);
-        inputRef.current?.focus();
-      } else {
-        handleSend();
-      }
-    }
-  };
-
-  const handleSuggestionClick = (suggestion: SearchSuggestion) => {
-    setInputMessage(`Search in ${suggestion.display_name}: `);
-    setShowSuggestions(false);
-    setSelectedSuggestionIndex(-1);
-    inputRef.current?.focus();
-  };
-
-  const highlightMatch = (text: string, start: number, end: number) => {
-    if (start < 0 || end <= start) return text;
-    return (
-      <>
-        {text.slice(0, start)}
-        <span className="bg-blue-200 dark:bg-blue-800 text-blue-900 dark:text-blue-100 px-0.5 rounded">
-          {text.slice(start, end)}
-        </span>
-        {text.slice(end)}
-      </>
-    );
-  };
-
-  const isValidServerPath = (path: string): boolean => {
-    if (!path || path.trim().length === 0) return false;
-    const trimmed = path.trim();
-    // Must be absolute path
-    if (!trimmed.startsWith("/")) return false;
-    // Reject dangerous patterns
-    const dangerous = [
-      /\.\./, // relative traversal
-      /^~/, // home directory
-      /[;&|`$(){}]/, // shell special chars
-      /\0/, // null byte
-      /[\r\n]/, // line endings
-    ];
-    return !dangerous.some((p) => p.test(trimmed));
-  };
-
-  const handleManualPathAdd = async () => {
-    const path = manualPath.trim();
-    if (!path) return;
-
-    // Frontend validation first
-    if (!isValidServerPath(path)) {
-      setPathError("Invalid path (must be absolute, no .., ~, or shell characters)");
-      return;
-    }
-
-    setPathError(null);
-
-    // Backend validation against allowed paths
-    try {
-      const res = await fetch(apiUrl(`/api/v1/file-browser?path=${encodeURIComponent(path)}`), {
-        headers: { ...getAuthHeaders() },
-      });
-      const data = await res.json();
-
-      if (!data.success) {
-        setPathError(data.error || "Permission denied: path is not accessible");
-        return;
-      }
-
-      // Path validated — add it
-      if (!selectedPaths.includes(path)) {
-        setSelectedPaths(prev => [...prev, path]);
-      }
-      setSelectedPath(path);
-      setChatState(prev => ({ ...prev, enableRag: true, selectedKb: path }));
-      setManualPath("");
-      setPathError(null);
-      setShowFileSelector(false);
-    } catch (e) {
-      setPathError("Failed to validate path. Please try again.");
-    }
-  };
-
-  const quickActions = [
-    {
-      icon: Calculator,
-      label: t("Smart Problem Solving"),
-      href: "/solver",
-      color: "blue",
-      description: "Multi-agent reasoning",
-    },
-    {
-      icon: Microscope,
-      label: t("Deep Research Reports"),
-      href: "/research",
-      color: "emerald",
-      description: "Comprehensive analysis",
-    },
-  ];
 
   const hasMessages = chatState.messages.length > 0;
 
   return (
-    <div className="h-screen flex animate-fade-in">
-      {/* Main Content Area */}
-      <div className="flex-1 flex flex-col min-w-0">
-      {/* Web-based File Browser (fallback when Tkinter is unavailable, e.g. Docker) */}
-      {fileBrowserMode && (
-        <FileBrowser
-          mode={fileBrowserMode}
-          t={t}
-          onSelect={(path) => {
-            setSelectedPath(path);
-            if (!selectedPaths.includes(path)) {
-              setSelectedPaths((prev) => [...prev, path]);
-            }
-            setChatState((prev) => ({
-              ...prev,
-              enableRag: true,
-              selectedKb: path,
-            }));
-            setFileBrowserMode(null);
-            setShowFileSelector(false);
-          }}
-          onCancel={() => {
-            setFileBrowserMode(null);
-          }}
-        />
-      )}
-
-      {/* File Selector Modal (available in both empty and chat views) */}
-      {showFileSelector && !fileBrowserMode && (
-        <div 
-          className="fixed inset-0 bg-black/50 flex items-center justify-center z-[99999]"
-          style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0 }}
-        >
-          <div className="bg-white dark:bg-slate-800 rounded-2xl p-6 max-w-md w-full mx-4 shadow-2xl relative z-[100000]">
-            <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100 mb-4">
-              {t("Select File or Folder")}
-            </h3>
-
-            {tkinterAvailable ? (
-            <div className="space-y-3">
-              {/* Single File Button */}
-              <button
-                type="button"
-                onClick={async () => {
-                  try {
-                    const response = await fetch(apiUrl("/api/v1/file-picker"), {
-                      method: "POST",
-                      headers: {
-                        "Content-Type": "application/json",
-                        ...getAuthHeaders(),
-                      },
-                      body: JSON.stringify({
-                        type: "files",
-                        multiple: false
-                      }),
-                    });
-
-                    const result = await response.json();
-
-                    if (result.success && result.data.paths.length > 0) {
-                      const filePath = result.data.paths[0];
-                      setSelectedPath(filePath);
-                      if (!selectedPaths.includes(filePath)) {
-                        setSelectedPaths(prev => [...prev, filePath]);
-                      }
-                      setChatState((prev) => ({
-                        ...prev,
-                        enableRag: true,
-                        selectedKb: filePath,
-                      }));
-                      setShowFileSelector(false);
-                    } else if (!result.success) {
-                      alert(result.error || t("Failed to open file picker"));
-                    }
-                  } catch (error) {
-                    console.error('Error calling file picker:', error);
-                    alert(t("Failed to open file picker"));
-                  }
-                }}
-                className="w-full px-4 py-3 text-sm font-medium bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 border-2 border-blue-200 dark:border-blue-700 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900/50 transition-colors flex items-center justify-center gap-2"
-              >
-                <FileText className="w-4 h-4" />
-                <span>{t("Single File")}</span>
-              </button>
-
-              {/* Folder Button */}
-              <button
-                type="button"
-                onClick={async () => {
-                  try {
-                    const response = await fetch(apiUrl("/api/v1/file-picker"), {
-                      method: "POST",
-                      headers: {
-                        "Content-Type": "application/json",
-                        ...getAuthHeaders(),
-                      },
-                      body: JSON.stringify({
-                        type: "directory",
-                        multiple: false
-                      }),
-                    });
-
-                    const result = await response.json();
-
-                    if (result.success && result.data.paths.length > 0) {
-                      const dirPath = result.data.paths[0];
-                      setSelectedPath(dirPath);
-                      if (!selectedPaths.includes(dirPath)) {
-                        setSelectedPaths(prev => [...prev, dirPath]);
-                      }
-                      setChatState((prev) => ({
-                        ...prev,
-                        enableRag: true,
-                        selectedKb: dirPath,
-                      }));
-                      setShowFileSelector(false);
-                    } else if (!result.success) {
-                      alert(result.error || t("Failed to open folder picker"));
-                    }
-                  } catch (error) {
-                    console.error('Error calling folder picker:', error);
-                    alert(t("Failed to open folder picker"));
-                  }
-                }}
-                className="w-full px-4 py-3 text-sm font-medium bg-purple-50 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 border-2 border-purple-200 dark:border-purple-700 rounded-lg hover:bg-purple-100 dark:hover:bg-purple-900/50 transition-colors flex items-center justify-center gap-2"
-              >
-                <Folder className="w-4 h-4" />
-                <span>{t("Folder")}</span>
-              </button>
-
-              {/* Custom Path Input */}
-              <div className="pt-2 border-t border-slate-200 dark:border-slate-700">
-                <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">
-                  {t("Custom Path")}
-                </label>
-                <input
-                  type="text"
-                  placeholder="/path/to/file or /path/to/folder"
-                  value={selectedPath}
-                  onChange={(e) => setSelectedPath(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && selectedPath.trim()) {
-                      const newPath = selectedPath.trim();
-                      if (!selectedPaths.includes(newPath)) {
-                        setSelectedPaths(prev => [...prev, newPath]);
-                      }
-                      setChatState((prev) => ({
-                        ...prev,
-                        enableRag: true,
-                        selectedKb: newPath,
-                      }));
-                      setShowFileSelector(false);
-                    }
-                  }}
-                  className="w-full px-3 py-2 border border-slate-200 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 text-sm"
-                />
-              </div>
+    <div className="h-screen flex flex-col bg-slate-50 dark:bg-slate-900">
+      <header className="border-b border-slate-200 dark:border-slate-700 bg-white/90 dark:bg-slate-800/90 backdrop-blur-sm">
+        <div className="max-w-5xl mx-auto px-6 py-4 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3 min-w-0">
+            <Image
+              src="/logo.svg"
+              alt={`${APP_NAME} Logo`}
+              width={40}
+              height={40}
+              className="object-contain shrink-0"
+              priority
+            />
+            <div className="min-w-0">
+              <h1 className="text-lg font-semibold text-slate-900 dark:text-slate-100 truncate">
+                {APP_NAME}
+              </h1>
+              <p className="text-sm text-slate-500 dark:text-slate-400 truncate">
+                {APP_SUBTITLE}
+              </p>
             </div>
-            ) : (
-            <div className="space-y-3">
-              {/* Server section */}
-              <p className="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t("Server")}</p>
-              <button
-                onClick={() => { setFileBrowserMode("directory"); setShowFileSelector(false); }}
-                className="w-full flex items-center gap-3 p-4 rounded-lg border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
-              >
-                <svg className="w-6 h-6 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
-                </svg>
-                <div className="text-left">
-                  <div className="font-medium text-gray-900 dark:text-gray-100">{t("Browse Server Folders")}</div>
-                  <div className="text-sm text-gray-500 dark:text-gray-400">{t("Select folders from the server filesystem")}</div>
-                </div>
-              </button>
-
-              {/* Upload section */}
-              <p className="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider mt-2">{t("Upload")}</p>
-              <button
-                onClick={() => { setShowUpload(true); setShowFileSelector(false); }}
-                className="w-full flex items-center gap-3 p-4 rounded-lg border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
-              >
-                <svg className="w-6 h-6 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-                </svg>
-                <div className="text-left">
-                  <div className="font-medium text-gray-900 dark:text-gray-100">{t("Upload Files")}</div>
-                  <div className="text-sm text-gray-500 dark:text-gray-400">{t("Upload files from your computer to the server")}</div>
-                </div>
-              </button>
-
-              <button
-                onClick={() => { setShowCollectionBrowser(true); setShowFileSelector(false); }}
-                className="w-full flex items-center gap-3 p-4 rounded-lg border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
-              >
-                <svg className="w-6 h-6 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-                </svg>
-                <div className="text-left">
-                  <div className="font-medium text-gray-900 dark:text-gray-100">{t("Browse Collections")}</div>
-                  <div className="text-sm text-gray-500 dark:text-gray-400">{t("Select from previously uploaded file collections")}</div>
-                </div>
-              </button>
-
-              {/* Manual section */}
-              <p className="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider mt-2">{t("Manual")}</p>
-              <div className="flex items-center gap-2 p-4 rounded-lg border border-gray-200 dark:border-gray-600">
-                <svg className="w-6 h-6 text-purple-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
-                </svg>
-                <div className="flex-1">
-                  <input
-                    type="text"
-                    value={manualPath}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      setManualPath(val);
-                      if (val.trim() && !isValidServerPath(val)) {
-                        setPathError("Invalid path (must be absolute, no .., ~, or shell characters)");
-                      } else {
-                        setPathError(null);
-                      }
-                    }}
-                    placeholder={t("Enter server path (e.g., /data/docs)")}
-                    className="w-full px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && manualPath.trim()) {
-                        e.preventDefault();
-                        handleManualPathAdd();
-                      }
-                    }}
-                  />
-                  {pathError && (
-                    <p className="text-red-400 text-xs mt-1">{pathError}</p>
-                  )}
-                </div>
-                <button
-                  onClick={handleManualPathAdd}
-                  disabled={!manualPath.trim() || !!pathError}
-                  className={`px-4 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium ${(!manualPath.trim() || pathError) ? "opacity-50 cursor-not-allowed" : ""}`}
-                >
-                  {t("Add")}
-                </button>
-              </div>
-            </div>
-            )}
-
-            <div className="flex gap-3 mt-6">
-              <button
-                onClick={() => {
-                  setShowFileSelector(false);
-                  setSelectedPath("");
-                }}
-                className="flex-1 px-4 py-2 text-slate-600 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200 border border-slate-200 dark:border-slate-600 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
-              >
-                {t("Cancel")}
-              </button>
-              <button
-                onClick={() => {
-                  if (selectedPath.trim()) {
-                    const newPath = selectedPath.trim();
-                    if (!selectedPaths.includes(newPath)) {
-                      setSelectedPaths(prev => [...prev, newPath]);
-                    }
-                    setChatState((prev) => ({
-                      ...prev,
-                      enableRag: true,
-                      selectedKb: newPath,
-                    }));
-                    setShowFileSelector(false);
-                  }
-                }}
-                disabled={!selectedPath.trim()}
-                className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-              >
-                {t("Confirm")}
-              </button>
-            </div>
+          </div>
+          <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full bg-teal-50 dark:bg-teal-900/30 border border-teal-100 dark:border-teal-700 text-teal-700 dark:text-teal-300 text-sm">
+            <ShieldCheck className="w-4 h-4" />
+            <span>{POLICY_KNOWLEDGE_LABEL}</span>
           </div>
         </div>
-      )}
-      {/* Empty State / Welcome Screen */}
-      {!hasMessages && (
-        <div className="flex-1 flex flex-col items-center justify-center px-6">
-          <div className="text-center max-w-2xl mx-auto mb-8">
-            <div className="flex items-center justify-center gap-4 mb-3">
-              <Image
-                src="/logo-v2.png"
-                alt="Sirchmunk Logo"
-                width={56}
-                height={56}
-                className="object-contain"
-                priority
-              />
-              <h1 className="text-4xl font-bold text-slate-900 dark:text-slate-100 tracking-tight">
-                {t("Welcome to Sirchmunk")}
-              </h1>
-            </div>
-            <p className="text-lg text-slate-500 dark:text-slate-400">
-              {t("Search to Learn, Evolve to Find.")}
-            </p>
-          </div>
+      </header>
 
-          {/* Input Box - Centered */}
-          <div className="w-full max-w-2xl mx-auto mb-12">
-            {/* Mode Toggles */}
-            <div className="flex items-center justify-between mb-3 px-1">
-              <div className="flex items-center gap-2">
-                {/* File Toggle */}
-                <button
-                  onClick={() => {
-                    if (!chatState.enableRag) {
-                      setShowFileSelector(true);
-                    } else {
-                      setChatState((prev) => ({
-                        ...prev,
-                        enableRag: false,
-                      }));
-                      setSelectedPath("");
-                    }
-                  }}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition-all ${
-                    chatState.enableRag
-                      ? "bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-700"
-                      : "bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 border border-slate-200 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700"
+      <main ref={messagesContainerRef} className="flex-1 overflow-y-auto">
+        {!hasMessages ? (
+          <div className="min-h-full flex items-center justify-center px-6 py-10">
+            <div className="w-full max-w-3xl">
+              <div className="text-center mb-8">
+                <div className="flex items-center justify-center mb-5">
+                  <Image
+                    src="/logo.svg"
+                    alt={`${APP_NAME} Logo`}
+                    width={72}
+                    height={72}
+                    className="object-contain"
+                    priority
+                  />
+                </div>
+                <h2 className="text-3xl font-semibold text-slate-900 dark:text-slate-100 mb-3">
+                  医保政策问答
+                </h2>
+                <p className="text-base text-slate-500 dark:text-slate-400">
+                  面向公众提供医保政策咨询、条款解释和办理指引。
+                </p>
+              </div>
+              <QuestionInput
+                value={inputMessage}
+                disabled={chatState.isLoading}
+                inputRef={inputRef}
+                onChange={setInputMessage}
+                onKeyDown={handleKeyDown}
+                onSend={handleSend}
+                onStop={stopChatMessage}
+                isLoading={chatState.isLoading}
+              />
+              <div className="mt-5 grid grid-cols-1 sm:grid-cols-3 gap-3">
+                {["医保报销范围怎么判断？", "异地就医备案怎么办理？", "门诊慢特病政策有哪些？"].map((text) => (
+                  <button
+                    key={text}
+                    onClick={() => setInputMessage(text)}
+                    className="text-left px-4 py-3 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-sm text-slate-600 dark:text-slate-300 hover:border-teal-300 dark:hover:border-teal-600 hover:text-teal-700 dark:hover:text-teal-300 transition-colors"
+                  >
+                    {text}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="max-w-5xl mx-auto px-6 py-6 space-y-6">
+            {chatState.messages.map((msg, index) => (
+              <div key={index} className="flex gap-4">
+                <div
+                  className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 ${
+                    msg.role === "user"
+                      ? "bg-slate-200 dark:bg-slate-700"
+                      : "bg-teal-600 text-white"
                   }`}
                 >
-                  <Database className="w-3.5 h-3.5" />
-                  {t("FileSystem")}
-                </button>
-
-                {/* Search Mode Selector */}
-                <div className="relative" ref={modeDropdownRef}>
-                  <button
-                    onClick={() => setShowModeDropdown(!showModeDropdown)}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition-all bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700"
-                  >
-                    <Zap className="w-3.5 h-3.5" />
-                    {t(chatState.searchMode)}
-                    <ChevronDown className="w-3 h-3" />
-                  </button>
-                  {showModeDropdown && (
-                    <div className="absolute top-full left-0 mt-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg shadow-lg z-50 min-w-[160px]">
-                      {(["FAST", "DEEP", "FILENAME_ONLY"] as const).map((mode) => (
-                        <button
-                          key={mode}
-                          onClick={() => {
-                            setChatState((prev: ChatState) => ({ ...prev, searchMode: mode }));
-                            setShowModeDropdown(false);
-                          }}
-                          className={`w-full text-left px-3 py-2 text-sm transition-colors first:rounded-t-lg last:rounded-b-lg ${
-                            chatState.searchMode === mode
-                              ? "bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300"
-                              : "text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700"
-                          }`}
-                        >
-                          <div className="font-medium">{t(mode)}</div>
-                          <div className="text-xs text-slate-400 dark:text-slate-500">{t(`${mode} Desc`)}</div>
-                        </button>
-                      ))}
-                    </div>
+                  {msg.role === "user" ? (
+                    <User className="w-4 h-4 text-slate-500 dark:text-slate-300" />
+                  ) : (
+                    <Bot className="w-4 h-4" />
                   )}
                 </div>
-
-                {/* Web Search Toggle (hidden for now) */}
-                {false && (
-                  <button
-                    onClick={() =>
-                      setChatState((prev) => ({
-                        ...prev,
-                        enableWebSearch: !prev.enableWebSearch,
-                      }))
-                    }
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition-all ${
-                      chatState.enableWebSearch
-                        ? "bg-emerald-100 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-700"
-                        : "bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 border border-slate-200 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700"
+                <div className="flex-1 min-w-0">
+                  <div
+                    className={`px-5 py-4 rounded-2xl border ${
+                      msg.role === "user"
+                        ? "bg-slate-100 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-200"
+                        : "bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-200 shadow-sm"
                     }`}
                   >
-                    <Globe className="w-3.5 h-3.5" />
-                    {t("WebSearch")}
-                  </button>
-                )}
-              </div>
-
-              {/* Selected Path Display */}
-              {chatState.enableRag && selectedPath && (
-                <div className="flex items-center gap-2 px-3 py-1.5 bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-700 rounded-lg text-sm">
-                  <span className="text-blue-700 dark:text-blue-300 font-medium truncate max-w-[200px]">
-                    {selectedPath.split('/').pop() || selectedPath}
-                  </span>
-                  <button
-                    onClick={() => {
-                      setSelectedPath("");
-                      setChatState((prev) => ({ ...prev, enableRag: false }));
-                    }}
-                    className="text-blue-500 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-200"
-                  >
-                    ×
-                  </button>
-                </div>
-              )}
-            </div>
-
-
-            {/* Input Field */}
-            <div className="relative">
-              <input
-                ref={inputRef}
-                type="text"
-                className="w-full px-5 py-4 pr-14 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-2xl focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all placeholder:text-slate-400 dark:placeholder:text-slate-500 text-slate-700 dark:text-slate-200 shadow-lg shadow-slate-200/50 dark:shadow-slate-900/50"
-                placeholder={t("Ask anything...")}
-                value={inputMessage}
-                onChange={(e) => setInputMessage(e.target.value)}
-                onKeyDown={handleKeyDown}
-                disabled={chatState.isLoading}
-              />
-              {chatState.isLoading ? (
-                <button
-                  onClick={stopChatMessage}
-                  className="absolute right-2 top-2 bottom-2 aspect-square bg-red-500 text-white rounded-xl flex items-center justify-center hover:bg-red-600 transition-all shadow-md shadow-red-500/20"
-                  title={t("Stop generating")}
-                >
-                  <Square className="w-4 h-4 fill-current" />
-                </button>
-              ) : (
-                <button
-                  onClick={handleSend}
-                  disabled={!inputMessage.trim()}
-                  className="absolute right-2 top-2 bottom-2 aspect-square bg-blue-600 text-white rounded-xl flex items-center justify-center hover:bg-blue-700 disabled:opacity-50 disabled:hover:bg-blue-600 transition-all shadow-md shadow-blue-500/20"
-                >
-                  <Send className="w-5 h-5" />
-                </button>
-              )}
-
-              {/* Search Suggestions Dropdown */}
-              {showSuggestions && searchSuggestions.length > 0 && (
-                <div
-                  ref={suggestionsRef}
-                  className="absolute top-full left-0 right-0 mt-2 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-xl shadow-slate-200/50 dark:shadow-slate-900/50 z-50 max-h-80 overflow-y-auto"
-                >
-                  <div className="p-2">
-                    <div className="text-xs text-slate-500 dark:text-slate-400 px-3 py-2 border-b border-slate-100 dark:border-slate-700">
-                      Found {searchSuggestions.length} file{searchSuggestions.length !== 1 ? 's' : ''} in {chatState.selectedKb}
+                    <div className="prose prose-slate dark:prose-invert prose-sm max-w-none">
+                      <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
+                        {processLatexContent(msg.content)}
+                      </ReactMarkdown>
                     </div>
-                    {searchSuggestions.map((suggestion, index) => (
-                      <button
-                        key={index}
-                        onClick={() => handleSuggestionClick(suggestion)}
-                        className={`w-full text-left px-3 py-3 rounded-lg transition-all duration-150 flex items-center gap-3 group ${
-                          index === selectedSuggestionIndex
-                            ? "bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-700"
-                            : "hover:bg-slate-50 dark:hover:bg-slate-700/50"
-                        }`}
-                      >
-                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-xs font-medium ${
-                          suggestion.type.toLowerCase() === 'pdf'
-                            ? 'bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400'
-                            : suggestion.type.toLowerCase() === 'docx'
-                            ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400'
-                            : suggestion.type.toLowerCase() === 'pptx'
-                            ? 'bg-orange-100 dark:bg-orange-900/30 text-orange-600 dark:text-orange-400'
-                            : suggestion.type.toLowerCase() === 'csv'
-                            ? 'bg-green-100 dark:bg-green-900/30 text-green-600 dark:text-green-400'
-                            : suggestion.type.toLowerCase() === 'xlsx'
-                            ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400'
-                            : 'bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-400'
-                        }`}>
-                          {suggestion.type}
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <div className="font-medium text-slate-900 dark:text-slate-100 text-sm truncate">
-                            {highlightMatch(suggestion.display_name, suggestion.highlight_start, suggestion.highlight_end)}
-                          </div>
-                          <div className="text-xs text-slate-500 dark:text-slate-400 truncate mt-0.5" title={suggestion.filename}>
-                            {suggestion.filename}{suggestion.size ? ` • ${suggestion.size}` : ""}
-                          </div>
-                        </div>
-                        <div className="text-xs text-slate-400 dark:text-slate-500 opacity-0 group-hover:opacity-100 transition-opacity">
-                          Tab to select
-                        </div>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-
-        </div>
-      )}
-
-      {/* Chat Interface - When there are messages */}
-      {hasMessages && (
-        <>
-          {/* Header Bar */}
-          <div className="flex items-center justify-between px-6 py-3 border-b border-slate-200 dark:border-slate-700 bg-white/80 dark:bg-slate-800/80 backdrop-blur-sm">
-            <div className="flex items-center gap-3">
-              {/* Mode Toggles */}
-              <button
-                onClick={() => {
-                  // Toggle RAG mode
-                  if (!chatState.enableRag) {
-                    // If there are already selected paths, just enable RAG
-                    if (selectedPaths.length > 0) {
-                      setChatState((prev) => ({
-                        ...prev,
-                        enableRag: true,
-                        selectedKb: selectedPaths[0],
-                      }));
-                    } else {
-                      // No paths yet, show file selector
-                      setShowFileSelector(true);
-                    }
-                  } else {
-                    // Disable RAG
-                    setChatState((prev) => ({
-                      ...prev,
-                      enableRag: false,
-                    }));
-                  }
-                }}
-                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition-all ${
-                  chatState.enableRag
-                    ? "bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300"
-                    : "bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400"
-                }`}
-              >
-                <Database className="w-3 h-3" />
-                File
-              </button>
-
-              {/* Search Mode Selector (compact) */}
-              <div className="relative">
-                <button
-                  onClick={() => setShowModeDropdown(!showModeDropdown)}
-                  className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium transition-all bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700"
-                >
-                  <Zap className="w-3 h-3" />
-                  {t(chatState.searchMode)}
-                  <ChevronDown className="w-3 h-3" />
-                </button>
-                {showModeDropdown && (
-                  <div
-                    ref={modeDropdownRef}
-                    className="absolute top-full left-0 mt-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg shadow-lg z-50 min-w-[150px]"
-                  >
-                    {(["FAST", "DEEP", "FILENAME_ONLY"] as const).map((mode) => (
-                      <button
-                        key={mode}
-                        onClick={() => {
-                          setChatState((prev) => ({ ...prev, searchMode: mode }));
-                          setShowModeDropdown(false);
-                        }}
-                        className={`w-full text-left px-3 py-2 text-xs transition-colors first:rounded-t-lg last:rounded-b-lg ${
-                          chatState.searchMode === mode
-                            ? "bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300"
-                            : "text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700"
-                        }`}
-                      >
-                        <div className="font-medium">{t(mode)}</div>
-                        <div className="text-xs text-slate-400 dark:text-slate-500">{t(`${mode} Desc`)}</div>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              {/* Suggestions Toggle */}
-              <button
-                onClick={() => setEnableSuggestions((prev) => !prev)}
-                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition-all ${
-                  enableSuggestions
-                    ? "bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-300"
-                    : "bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400"
-                }`}
-                title={t("Toggle file suggestions while typing")}
-              >
-                <Lightbulb className="w-3 h-3" />
-                {t("Suggest")}
-              </button>
-
-              {/* Web Search Button - Temporarily hidden but functionality preserved */}
-              {false && (
-                <button
-                  onClick={() =>
-                    setChatState((prev) => ({
-                      ...prev,
-                      enableWebSearch: !prev.enableWebSearch,
-                    }))
-                  }
-                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition-all ${
-                    chatState.enableWebSearch
-                      ? "bg-emerald-100 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-300"
-                      : "bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400"
-                  }`}
-                >
-                  <Globe className="w-3 h-3" />
-                  {t("WebSearch")}
-                </button>
-              )}
-
-              {chatState.enableRag && (
-                <div className="relative">
-                  <div className="flex items-center gap-1">
-                    <button
-                      onClick={() => setShowPathDropdown(!showPathDropdown)}
-                      className="flex items-center gap-1 px-2 py-1 text-xs bg-slate-100 dark:bg-slate-800 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors dark:text-slate-200"
-                    >
-                      <span className="max-w-[120px] truncate">
-                        {chatState.selectedKb ? (chatState.selectedKb.split('/').pop() || chatState.selectedKb) : 'Select Path'}
-                      </span>
-                      <ChevronDown className="w-3 h-3" />
-                    </button>
-                    <button
-                      onClick={() => setShowFileSelector(true)}
-                      className="flex items-center justify-center w-6 h-6 text-xs bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400 rounded hover:bg-blue-200 dark:hover:bg-blue-900/70 transition-colors"
-                      title="Add new path"
-                    >
-                      +
-                    </button>
-                  </div>
-
-                  {showPathDropdown && selectedPaths.length > 0 && (
-                    <div
-                      ref={pathDropdownRef}
-                      className="absolute top-full left-0 mt-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg shadow-lg z-50 min-w-[200px]"
-                    >
-                      {selectedPaths.map((path, index) => (
-                        <div key={index} className="flex items-center justify-between px-3 py-2 hover:bg-slate-50 dark:hover:bg-slate-700 first:rounded-t-lg last:rounded-b-lg">
-                          <button
-                            onClick={() => {
-                              setChatState((prev) => ({
-                                ...prev,
-                                selectedKb: path,
-                              }));
-                              setShowPathDropdown(false);
-                            }}
-                            className="flex-1 text-left text-xs text-slate-700 dark:text-slate-300 truncate"
-                            title={path}
-                          >
-                            {path.split('/').pop() || path}
-                          </button>
-                          <button
-                            onClick={() => {
-                              const newPaths = selectedPaths.filter((_, i) => i !== index);
-                              setSelectedPaths(newPaths);
-                              if (chatState.selectedKb === path) {
-                                setChatState((prev) => ({
-                                  ...prev,
-                                  selectedKb: newPaths[0] || "",
-                                  enableRag: newPaths.length > 0,
-                                }));
-                              }
-                            }}
-                            className="ml-2 text-slate-400 hover:text-red-500 dark:text-slate-500 dark:hover:text-red-400"
-                          >
-                            ×
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setShowUpload(true)}
-                className="p-2 rounded-md hover:bg-gray-100 dark:hover:bg-gray-700"
-                title="Upload files"
-              >
-                <svg className="w-5 h-5 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-                </svg>
-              </button>
-              <button
-                onClick={newChatSession}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-slate-500 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30 rounded-lg transition-colors"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                {t("New Chat")}
-              </button>
-            </div>
-          </div>
-
-          {/* Messages Area */}
-          <div
-            ref={messagesContainerRef}
-            className="flex-1 overflow-y-auto px-6 py-6 space-y-6"
-          >
-            {chatState.messages.map((msg, idx) => (
-              <div
-                key={idx}
-                className="flex gap-4 w-full max-w-4xl mx-auto animate-in fade-in slide-in-from-bottom-2"
-              >
-                {msg.role === "user" ? (
-                  <>
-                    <div className="w-8 h-8 rounded-full bg-slate-200 dark:bg-slate-700 flex items-center justify-center shrink-0">
-                      <User className="w-4 h-4 text-slate-500 dark:text-slate-400" />
-                    </div>
-                    <div className="flex-1 bg-slate-100 dark:bg-slate-700 px-4 py-3 rounded-2xl rounded-tl-none text-slate-800 dark:text-slate-200">
-                      {msg.content}
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center shrink-0 shadow-lg shadow-blue-500/30">
-                      <Bot className="w-4 h-4 text-white" />
-                    </div>
-                    <div className="flex-1 space-y-3">
-                      <div className="bg-white dark:bg-slate-800 px-5 py-4 rounded-2xl rounded-tl-none border border-slate-200 dark:border-slate-700 shadow-sm">
-                        <div className="prose prose-slate dark:prose-invert prose-sm max-w-none">
-                          <ReactMarkdown
-                            remarkPlugins={[remarkMath]}
-                            rehypePlugins={[rehypeKatex]}
-                          >
-                            {processLatexContent(msg.content)}
-                          </ReactMarkdown>
-                        </div>
-
-                        {/* Loading indicator */}
-                        {msg.isStreaming && (
-                          <div className="flex items-center gap-2 mt-3 text-blue-600 dark:text-blue-400 text-sm">
-                            <Loader2 className="w-4 h-4 animate-spin" />
-                            <span>{t("Generating response...")}</span>
-                          </div>
-                        )}
-
-                        {/* Search Logs */}
-                        {msg.searchLogs && msg.searchLogs.length > 0 && (
-                          <div className="mt-4 p-3 bg-slate-50 dark:bg-slate-800 rounded-lg border border-slate-200 dark:border-slate-700">
-                            <div className="flex items-center gap-2 mb-2">
-                              <Search className="w-4 h-4 text-slate-500 dark:text-slate-400" />
-                              <span className="text-sm font-medium text-slate-700 dark:text-slate-300">Search Process</span>
-                            </div>
-                            <div 
-                              className="space-y-1 max-h-48 overflow-y-auto"
-                              ref={(el) => {
-                                // Auto-scroll to bottom when new logs arrive
-                                if (el && msg.isStreaming) {
-                                  el.scrollTop = el.scrollHeight;
-                                }
-                              }}
-                            >
-                              {msg.searchLogs.map((log, logIndex) => (
-                                <div
-                                  key={logIndex}
-                                  className={`text-xs px-2 py-1 rounded font-mono ${
-                                    log.level === 'error'
-                                      ? 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300'
-                                      : log.level === 'warning'
-                                      ? 'bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300'
-                                      : log.level === 'success'
-                                      ? 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300'
-                                      : 'bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-400'
-                                  }`}
-                                >
-                                  {/* Only show timestamp for non-streaming messages */}
-                                  {!log.is_streaming && (
-                                    <span className="opacity-60 mr-2">
-                                      {new Date(log.timestamp).toLocaleTimeString()}
-                                    </span>
-                                  )}
-                                  <span style={{ whiteSpace: log.is_streaming ? 'pre' : 'pre-wrap' }}>
-                                    {log.message}
-                                  </span>
-                                </div>
-                              ))}
-                            </div>
-                          </div>
-                        )}
+                    {msg.isStreaming && (
+                      <div className="flex items-center gap-2 mt-3 text-teal-600 dark:text-teal-300 text-sm">
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        <span>正在查询医保政策知识库...</span>
                       </div>
-
-                      {/* Sources */}
-                      {msg.sources &&
-                        (msg.sources.rag?.length ?? 0) +
-                          (msg.sources.web?.length ?? 0) >
-                          0 && (
-                          <div className="flex flex-wrap gap-2">
-                            {msg.sources.rag?.map((source, i) => (
-                              <div
-                                key={`rag-${i}`}
-                                className="flex items-center gap-1.5 px-2.5 py-1 bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 rounded-lg text-xs"
-                              >
-                                <BookOpen className="w-3 h-3" />
-                                <span>{source.kb_name}</span>
+                    )}
+                  </div>
+                  {msg.role === "assistant" &&
+                    msg.sources?.references &&
+                    msg.sources.references.length > 0 && (
+                      <details className="mt-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800">
+                        <summary className="flex items-center gap-2 px-3 py-2 cursor-pointer text-xs font-medium text-slate-600 dark:text-slate-300">
+                          <BookOpen className="w-3.5 h-3.5 text-teal-500" />
+                          参考依据 ({msg.sources.references.length})
+                        </summary>
+                        <div className="divide-y divide-slate-100 dark:divide-slate-700">
+                          {msg.sources.references.map((ref, refIndex) => (
+                            <div key={refIndex} className="px-3 py-2.5 space-y-1.5">
+                              <div className="flex items-center gap-1.5 text-xs font-medium text-slate-700 dark:text-slate-300">
+                                <FileText className="w-3.5 h-3.5 text-teal-500 shrink-0" />
+                                <span className="truncate">{ref.file.split("/").pop()}</span>
                               </div>
-                            ))}
-                            {msg.sources.web?.slice(0, 3).map((source, i) => (
-                              <a
-                                key={`web-${i}`}
-                                href={source.url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="flex items-center gap-1.5 px-2.5 py-1 bg-emerald-50 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300 rounded-lg text-xs hover:bg-emerald-100 dark:hover:bg-emerald-900/50 transition-colors"
-                              >
-                                <Globe className="w-3 h-3" />
-                                <span className="max-w-[150px] truncate">
-                                  {source.title || source.url}
-                                </span>
-                                <ExternalLink className="w-3 h-3" />
-                              </a>
-                            ))}
-                          </div>
-                        )}
-
-                      {/* References (evidence from search) */}
-                      {msg.sources?.references && msg.sources.references.length > 0 && (
-                        <div className="mt-2 border border-slate-200 dark:border-slate-700 rounded-lg overflow-hidden">
-                          <details className="group">
-                            <summary className="flex items-center gap-2 px-3 py-2 cursor-pointer select-none bg-slate-50 dark:bg-slate-800/50 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors">
-                              <ChevronDown className="w-3.5 h-3.5 text-slate-400 transition-transform group-open:rotate-180" />
-                              <BookOpen className="w-3.5 h-3.5 text-amber-500" />
-                              <span className="text-xs font-medium text-slate-600 dark:text-slate-300">
-                                {t("References")} ({msg.sources.references.length})
-                              </span>
-                            </summary>
-                            <div className="divide-y divide-slate-100 dark:divide-slate-700/50">
-                              {msg.sources.references.map((ref, i) => (
-                                <div key={`ref-${i}`} className="px-3 py-2.5 space-y-1.5">
-                                  <div className="flex items-center gap-1.5">
-                                    <FileText className="w-3 h-3 text-blue-500 shrink-0 mt-0.5" />
-                                    <div className="min-w-0">
-                                      <span className="text-xs font-medium text-slate-700 dark:text-slate-300 block truncate">
-                                        {ref.file.split('/').pop()}
-                                      </span>
-                                      <span className="text-[10px] text-slate-400 dark:text-slate-500 block truncate select-all" title={ref.file}>
-                                        {ref.file}
-                                      </span>
-                                    </div>
-                                  </div>
-                                  {ref.summary && (
-                                    <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
-                                      {ref.summary}
-                                    </p>
-                                  )}
-                                  {ref.snippets && ref.snippets.length > 0 && (
-                                    <div className="space-y-1">
-                                      {ref.snippets.map((snippet: string, si: number) => (
-                                        <pre
-                                          key={si}
-                                          className="text-xs bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 px-2 py-1.5 rounded overflow-x-auto whitespace-pre-wrap break-words leading-relaxed"
-                                        >
-                                          {snippet}
-                                        </pre>
-                                      ))}
-                                    </div>
-                                  )}
-                                </div>
+                              {ref.summary && (
+                                <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
+                                  {ref.summary}
+                                </p>
+                              )}
+                              {ref.snippets?.slice(0, 2).map((snippet: string, snippetIndex: number) => (
+                                <p
+                                  key={snippetIndex}
+                                  className="text-xs bg-slate-50 dark:bg-slate-900 text-slate-600 dark:text-slate-400 px-2 py-1.5 rounded leading-relaxed"
+                                >
+                                  {snippet}
+                                </p>
                               ))}
                             </div>
-                          </details>
+                          ))}
                         </div>
-                      )}
-                    </div>
-                  </>
-                )}
+                      </details>
+                    )}
+                </div>
               </div>
             ))}
+          </div>
+        )}
+      </main>
 
-            {/* Status indicator */}
-            {chatState.isLoading && chatState.currentStage && (
-              <div className="flex gap-4 w-full max-w-4xl mx-auto">
-                <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center shrink-0">
-                  <Loader2 className="w-4 h-4 text-white animate-spin" />
-                </div>
-                <div className="flex-1 bg-slate-100 dark:bg-slate-800 px-4 py-3 rounded-2xl rounded-tl-none">
-                  <div className="flex items-center gap-2 text-slate-600 dark:text-slate-300 text-sm">
-                    <span className="relative flex h-2 w-2">
-                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>
-                      <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500"></span>
-                    </span>
-                    {chatState.currentStage === "rag" &&
-                      t("Searching knowledge base...")}
-                    {chatState.currentStage === "web" &&
-                      t("Searching the web...")}
-                    {chatState.currentStage === "generating" &&
-                      t("Generating response...")}
-                    {!["rag", "web", "generating"].includes(
-                      chatState.currentStage,
-                    ) && chatState.currentStage}
-                  </div>
-                </div>
+      {hasMessages && (
+        <footer className="border-t border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-6 py-4">
+          <div className="max-w-5xl mx-auto space-y-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
+                <ShieldCheck className="w-4 h-4 text-teal-500" />
+                <span>{POLICY_KNOWLEDGE_LABEL}</span>
               </div>
-            )}
-
-            <div ref={chatEndRef} />
-          </div>
-
-          {/* Input Area - Fixed at bottom */}
-          <div className="border-t border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-6 py-4">
-            <div className="max-w-4xl mx-auto relative">
-              <input
-                ref={inputRef}
-                type="text"
-                className="w-full px-5 py-3.5 pr-14 bg-slate-50 dark:bg-slate-700 border border-slate-200 dark:border-slate-600 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all placeholder:text-slate-400 dark:placeholder:text-slate-500 text-slate-700 dark:text-slate-200"
-                placeholder={t("Input message or search the web via g: xx or G: xx ...")}
-                value={inputMessage}
-                onChange={(e) => setInputMessage(e.target.value)}
-                onKeyDown={handleKeyDown}
-                disabled={chatState.isLoading}
-              />
-              {chatState.isLoading ? (
+              <div className="flex items-center gap-2">
                 <button
-                  onClick={stopChatMessage}
-                  className="absolute right-2 top-2 bottom-2 aspect-square bg-red-500 text-white rounded-lg flex items-center justify-center hover:bg-red-600 transition-all"
-                  title={t("Stop generating")}
+                  onClick={clearChatHistory}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700"
                 >
-                  <Square className="w-4 h-4 fill-current" />
+                  <Trash2 className="w-3.5 h-3.5" />
+                  清空
                 </button>
-              ) : (
                 <button
-                  onClick={handleSend}
-                  disabled={!inputMessage.trim()}
-                  className="absolute right-2 top-2 bottom-2 aspect-square bg-blue-600 text-white rounded-lg flex items-center justify-center hover:bg-blue-700 disabled:opacity-50 disabled:hover:bg-blue-600 transition-all"
+                  onClick={newChatSession}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700"
                 >
-                  <Send className="w-5 h-5" />
+                  <Plus className="w-3.5 h-3.5" />
+                  新对话
                 </button>
-              )}
-
-              {/* Search Suggestions Dropdown */}
-              {showSuggestions && searchSuggestions.length > 0 && (
-                <div
-                  ref={suggestionsRef}
-                  className="absolute bottom-full left-0 right-0 mb-2 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-xl shadow-slate-200/50 dark:shadow-slate-900/50 z-50 max-h-80 overflow-y-auto"
-                >
-                  <div className="p-2">
-                    <div className="text-xs text-slate-500 dark:text-slate-400 px-3 py-2 border-b border-slate-100 dark:border-slate-700">
-                      Found {searchSuggestions.length} file{searchSuggestions.length !== 1 ? 's' : ''} in {chatState.selectedKb}
-                    </div>
-                    {searchSuggestions.map((suggestion, index) => (
-                      <button
-                        key={index}
-                        onClick={() => handleSuggestionClick(suggestion)}
-                        className={`w-full text-left px-3 py-3 rounded-lg transition-all duration-150 flex items-center gap-3 group ${
-                          index === selectedSuggestionIndex
-                            ? "bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-700"
-                            : "hover:bg-slate-50 dark:hover:bg-slate-700/50"
-                        }`}
-                      >
-                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-xs font-medium ${
-                          suggestion.type.toLowerCase() === 'pdf'
-                            ? 'bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400'
-                            : suggestion.type.toLowerCase() === 'docx'
-                            ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400'
-                            : suggestion.type.toLowerCase() === 'pptx'
-                            ? 'bg-orange-100 dark:bg-orange-900/30 text-orange-600 dark:text-orange-400'
-                            : suggestion.type.toLowerCase() === 'csv'
-                            ? 'bg-green-100 dark:bg-green-900/30 text-green-600 dark:text-green-400'
-                            : suggestion.type.toLowerCase() === 'xlsx'
-                            ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400'
-                            : 'bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-400'
-                        }`}>
-                          {suggestion.type}
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <div className="font-medium text-slate-900 dark:text-slate-100 text-sm truncate">
-                            {highlightMatch(suggestion.display_name, suggestion.highlight_start, suggestion.highlight_end)}
-                          </div>
-                          <div className="text-xs text-slate-500 dark:text-slate-400 truncate mt-0.5" title={suggestion.filename}>
-                            {suggestion.filename}{suggestion.size ? ` • ${suggestion.size}` : ""}
-                          </div>
-                        </div>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
+              </div>
             </div>
+            <QuestionInput
+              value={inputMessage}
+              disabled={chatState.isLoading}
+              inputRef={inputRef}
+              onChange={setInputMessage}
+              onKeyDown={handleKeyDown}
+              onSend={handleSend}
+              onStop={stopChatMessage}
+              isLoading={chatState.isLoading}
+            />
           </div>
-        </>
+        </footer>
       )}
-      </div>
+    </div>
+  );
+}
 
-      <FileUpload
-        isOpen={showUpload}
-        onClose={() => setShowUpload(false)}
-        onUploadComplete={(path) => {
-          if (path && !selectedPaths.includes(path)) {
-            setSelectedPaths(prev => [...prev, path]);
-          }
-          setSelectedPath(path);
-          setChatState(prev => ({ ...prev, enableRag: true, selectedKb: path }));
-          setShowUpload(false);
-          setShowFileSelector(false);
-        }}
+function QuestionInput({
+  value,
+  disabled,
+  inputRef,
+  isLoading,
+  onChange,
+  onKeyDown,
+  onSend,
+  onStop,
+}: {
+  value: string;
+  disabled: boolean;
+  isLoading: boolean;
+  onChange: (value: string) => void;
+  inputRef: RefObject<HTMLInputElement | null>;
+  onKeyDown: (event: KeyboardEvent<HTMLInputElement>) => void;
+  onSend: () => void;
+  onStop: () => void;
+}) {
+  return (
+    <div className="relative">
+      <input
+        ref={inputRef}
+        type="text"
+        className="w-full px-5 py-4 pr-14 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 transition-all placeholder:text-slate-400 dark:placeholder:text-slate-500 text-slate-700 dark:text-slate-200 shadow-sm"
+        placeholder="请输入医保政策相关问题..."
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={onKeyDown}
+        disabled={disabled}
       />
-
-      <CollectionBrowser
-        isOpen={showCollectionBrowser}
-        onClose={() => setShowCollectionBrowser(false)}
-        onSelectPath={(path) => {
-          if (!selectedPaths.includes(path)) {
-            setSelectedPaths(prev => [...prev, path]);
-          }
-          setSelectedPath(path);
-          setChatState(prev => ({ ...prev, enableRag: true, selectedKb: path }));
-          setShowCollectionBrowser(false);
-          setShowFileSelector(false);
-        }}
-      />
+      {isLoading ? (
+        <button
+          onClick={onStop}
+          className="absolute right-2 top-2 bottom-2 aspect-square bg-red-500 text-white rounded-lg flex items-center justify-center hover:bg-red-600 transition-all"
+          title="停止生成"
+        >
+          <Square className="w-4 h-4 fill-current" />
+        </button>
+      ) : (
+        <button
+          onClick={onSend}
+          disabled={!value.trim()}
+          className="absolute right-2 top-2 bottom-2 aspect-square bg-teal-600 text-white rounded-lg flex items-center justify-center hover:bg-teal-700 disabled:opacity-50 disabled:hover:bg-teal-600 transition-all"
+          title="发送"
+        >
+          <Send className="w-5 h-5" />
+        </button>
+      )}
     </div>
   );
 }

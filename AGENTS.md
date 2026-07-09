@@ -6,7 +6,8 @@ Sirchmunk 是一个 Python 包，并内置 Next.js Web UI。核心 Python 代码
 
 ## 构建、测试与本地开发命令
 
-- `pip install -e ".[all]"`：以源码模式安装，并包含所有可选依赖。
+- `uv venv --python 3.12 .venv`：使用 `uv` 创建本地虚拟环境。
+- `uv pip install -e ".[all]"`：以源码模式安装，并包含所有可选依赖。
 - `sirchmunk init`：创建本地工作目录，并基于 `config/env.example` 生成 `.env`。
 - `sirchmunk serve`：启动后端 API 服务。
 - `sirchmunk web serve --dev`：启动 API 与 Next.js 开发服务器。
@@ -14,6 +15,8 @@ Sirchmunk 是一个 Python 包，并内置 Next.js Web UI。核心 Python 代码
 - `cd web && npm run lint`：运行 Next.js/ESLint 检查。
 - `cd web && npm run build`：构建 Web UI。
 - `pytest`：运行 Python 测试。
+
+Python 包管理和虚拟环境必须始终使用 `uv`，不要使用 `pip`、`python -m venv`、`virtualenv`、`poetry` 或 `conda` 管理本项目的 Python 依赖与环境。
 
 ## 编码风格与命名规范
 

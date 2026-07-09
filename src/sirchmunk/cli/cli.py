@@ -152,7 +152,7 @@ SIRCHMUNK_VERBOSE=false
 # ===== Search Settings =====
 # Default search paths (comma-separated), e.g. /data/docs,/data/pdfs
 # When set, acts as the default for search(..., paths=...) if none are provided.
-SIRCHMUNK_SEARCH_PATHS=
+SIRCHMUNK_SEARCH_PATHS=/Users/wilder/dev/MediPolicyAI/policy-docs
 
 # Maximum chat history turns for multi-turn context (0 = disabled)
 CHAT_HISTORY_MAX_TURNS=5
@@ -232,11 +232,15 @@ SIRCHMUNK_ALLOWED_ORIGINS=
 # Allowed file browser paths, comma-separated (default: unrestricted)
 # When set, the /file-browser endpoint can only access these directories and their children
 # Example: /home/user/docs,/data/shared
-SIRCHMUNK_ALLOWED_PATHS=
+SIRCHMUNK_ALLOWED_PATHS=/Users/wilder/dev/MediPolicyAI/policy-docs
 
 # Enable API documentation (Swagger UI at /docs, ReDoc at /redoc)
 # Set to "true" for development, "false" (default) for production
 SIRCHMUNK_DEBUG=false
+
+# Public service mode exposes only public Q&A APIs and hides internal settings,
+# monitoring, upload, file browser, direct search, and knowledge management APIs.
+SIRCHMUNK_PUBLIC_SERVICE=true
 
 # Maximum concurrent WebSocket connections (default: 100)
 SIRCHMUNK_MAX_WS_CONNECTIONS=100

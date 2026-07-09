@@ -5893,7 +5893,7 @@ class AgenticSearch(BaseSearch):
     @staticmethod
     def _parse_fast_json(text: str) -> Dict[str, Any]:
         """Extract JSON from the FAST query analysis LLM response."""
-        text = text.strip()
+        text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.IGNORECASE | re.DOTALL).strip()
         try:
             return json.loads(text)
         except (json.JSONDecodeError, TypeError):

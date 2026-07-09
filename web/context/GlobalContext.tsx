@@ -8,6 +8,7 @@ import React, {
   useEffect,
 } from "react";
 import { wsUrl, apiUrl, getAuthHeaders } from "@/lib/api";
+import { POLICY_KNOWLEDGE_PATH } from "@/lib/public-service";
 import {
   initializeTheme,
   setTheme as setThemeLib,
@@ -620,8 +621,8 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
     sessionId: null,
     messages: [],
     isLoading: false,
-    selectedKb: "",
-    enableRag: false,
+    selectedKb: POLICY_KNOWLEDGE_PATH,
+    enableRag: true,
     enableWebSearch: false,
     searchMode: "FAST",
     currentStage: null,
@@ -874,8 +875,18 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
       setChatState((prev) => {
         // Only reset if still loading (don't override a successful completion)
         if (prev.isLoading) {
+          const messages = [...prev.messages];
+          const lastMessage = messages[messages.length - 1];
+          if (lastMessage?.role === "assistant" && lastMessage?.isStreaming) {
+            messages[messages.length - 1] = {
+              ...lastMessage,
+              isStreaming: false,
+              content: lastMessage.content || "请求已中断，请重试。",
+            };
+          }
           return {
             ...prev,
+            messages,
             isLoading: false,
             currentStage: null,
           };
