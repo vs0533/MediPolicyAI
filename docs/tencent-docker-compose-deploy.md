@@ -13,16 +13,23 @@
 
 - `TENCENT_USER`：SSH 用户，默认 `root`
 - `TENCENT_PORT`：SSH 端口，默认 `22`
-- `TENCENT_DEPLOY_PATH`：部署目录，默认 `/opt/medipolicyai`
+- `TENCENT_DEPLOY_PATH`：部署目录，默认 `~/medipolicyai`
 
 如果部署日志出现 `Permission denied (publickey,password)`，通常是 `SSH_PRIVATE_KEY` 和服务器用户不匹配。请确认私钥对应目标用户的 `~/.ssh/authorized_keys`，并配置正确的 `TENCENT_USER`，例如 `root`、`ubuntu` 或你的实际登录用户。
+
+如果希望部署到 `/opt/medipolicyai`，需要先在服务器上创建目录并授权给部署用户：
+
+```bash
+sudo mkdir -p /opt/medipolicyai
+sudo chown -R 当前部署用户:当前部署用户 /opt/medipolicyai
+```
 
 ## 服务器目录
 
 部署后目录结构：
 
 ```text
-/opt/medipolicyai/
+~/medipolicyai/
   current/              # 当前代码，由 Actions 自动更新
   current.prev/         # 上一个版本，便于手动回滚
   shared/
@@ -37,7 +44,7 @@
 
 ```bash
 ssh root@你的服务器
-vim /opt/medipolicyai/shared/.env
+vim ~/medipolicyai/shared/.env
 ```
 
 至少需要配置：
@@ -51,7 +58,7 @@ LLM_MODEL_NAME=gpt-5.2
 把政策文件放到：
 
 ```bash
-/opt/medipolicyai/shared/policy-docs
+~/medipolicyai/shared/policy-docs
 ```
 
 然后重新运行 GitHub Actions 的“部署到腾讯云”workflow。
@@ -70,7 +77,7 @@ git push origin v1.0.0
 ## 常用运维命令
 
 ```bash
-cd /opt/medipolicyai/current
+cd ~/medipolicyai/current
 docker compose -f docker-compose.prod.yml ps
 docker compose -f docker-compose.prod.yml logs -f
 docker compose -f docker-compose.prod.yml restart
@@ -81,7 +88,7 @@ docker compose -f docker-compose.prod.yml restart
 如果新版本异常，可以在服务器上执行：
 
 ```bash
-cd /opt/medipolicyai
+cd ~/medipolicyai
 rm -rf current.bad
 mv current current.bad
 mv current.prev current

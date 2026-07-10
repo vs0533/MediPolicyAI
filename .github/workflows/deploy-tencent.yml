@@ -62,17 +62,7 @@ jobs:
 
       - name: 打包源码
         run: |
-          tar \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='.sirchmunk' \
-            --exclude='.uv-cache' \
-            --exclude='graphify-out' \
-            --exclude='policy-docs' \
-            --exclude='web/node_modules' \
-            --exclude='web/.next' \
-            --exclude='web/out' \
-            -czf /tmp/medipolicyai-${GITHUB_SHA}.tar.gz .
+          git archive --format=tar.gz --output="/tmp/medipolicyai-${GITHUB_SHA}.tar.gz" HEAD
 
       - name: 配置 SSH
         run: |
@@ -115,7 +105,7 @@ jobs:
         run: |
           REMOTE_USER="${TENCENT_USER:-root}"
           REMOTE_PORT="${TENCENT_PORT:-22}"
-          DEPLOY_PATH="${TENCENT_DEPLOY_PATH:-/opt/medipolicyai}"
+          DEPLOY_PATH="${TENCENT_DEPLOY_PATH:-~/medipolicyai}"
           ssh \
             -p "$REMOTE_PORT" \
             -i ~/.ssh/tencent_key \
