@@ -4,6 +4,8 @@ export const APP_SUBTITLE = '医保政策公共问答服务'
 
 export const POLICY_KNOWLEDGE_LABEL = '医保政策知识库'
 
+export const APP_VERSION = process.env.NEXT_PUBLIC_APP_VERSION || 'local'
+
 export const POLICY_KNOWLEDGE_PATH =
   '/Users/wilder/dev/MediPolicyAI/policy-docs'
 

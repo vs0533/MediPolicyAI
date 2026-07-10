@@ -51,10 +51,10 @@ docker run -d \
 | `-e LLM_MODEL_NAME` | No | `gpt-5.2` | LLM model name (e.g., `MiniMax-M3`, `MiniMax-M2.7`, `MiniMax-M2.7-highspeed`) |
 | `-e LLM_TIMEOUT` | No | `60.0` | LLM request timeout in seconds |
 | `-e UI_THEME` | No | `light` | WebUI theme (`light` / `dark`) |
-| `-e UI_LANGUAGE` | No | `en` | WebUI language (`en` / `zh`) |
+| `-e UI_LANGUAGE` | No | `zh` | WebUI language (`en` / `zh`) |
 | `-e SIRCHMUNK_VERBOSE` | No | `false` | Enable verbose logging (`true` / `false`) |
 | `-e SIRCHMUNK_SEARCH_PATHS` | No | (empty) | Comma-separated default search paths (e.g. `/mnt/docs`) |
-| `-e CHAT_HISTORY_MAX_TURNS` | No | `5` | Max chat history turns for multi-turn context |
+| `-e CHAT_HISTORY_MAX_TURNS` | No | `0` | Max chat history turns for multi-turn context |
 | `-e CHAT_HISTORY_MAX_TOKENS` | No | `32000` | Max tokens for chat history context |
 | `-p 8584:8584` | Yes | | Expose WebUI and API port |
 | `-v /data/sirchmunk:/data/sirchmunk` | Recommended | | Persist data (models, history, knowledge) across restarts |

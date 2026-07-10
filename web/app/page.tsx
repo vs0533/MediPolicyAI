@@ -28,6 +28,7 @@ import { processLatexContent } from "@/lib/latex";
 import {
   APP_NAME,
   APP_SUBTITLE,
+  APP_VERSION,
   POLICY_KNOWLEDGE_LABEL,
   POLICY_KNOWLEDGE_PATH,
 } from "@/lib/public-service";
@@ -152,9 +153,14 @@ export default function HomePage() {
               </p>
             </div>
           </div>
-          <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full bg-teal-50 dark:bg-teal-900/30 border border-teal-100 dark:border-teal-700 text-teal-700 dark:text-teal-300 text-sm">
-            <ShieldCheck className="w-4 h-4" />
-            <span>{POLICY_KNOWLEDGE_LABEL}</span>
+          <div className="flex items-center gap-2 shrink-0">
+            <span className="rounded-full border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 px-2 py-1 text-xs font-medium text-slate-500 dark:text-slate-400">
+              {APP_VERSION}
+            </span>
+            <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full bg-teal-50 dark:bg-teal-900/30 border border-teal-100 dark:border-teal-700 text-teal-700 dark:text-teal-300 text-sm">
+              <ShieldCheck className="w-4 h-4" />
+              <span>{POLICY_KNOWLEDGE_LABEL}</span>
+            </div>
           </div>
         </div>
       </header>

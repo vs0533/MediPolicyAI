@@ -14,9 +14,11 @@ import asyncio
 import dataclasses
 import multiprocessing as mp
 import os
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, List, Optional, Sequence, Union
+import xml.etree.ElementTree as ET
 
 from loguru import logger
 
@@ -317,6 +319,14 @@ class DocumentExtractor:
                     )
             return output
         except Exception as exc:
+            fallback = DocumentExtractor._fallback_docx(file_path, profile)
+            if fallback is not None:
+                logger.warning(
+                    "Document extraction for {} fell back to python-docx/xml: {}",
+                    file_path,
+                    exc,
+                )
+                return fallback
             logger.error(
                 "Document extraction failed for {}: {}",
                 file_path,
@@ -368,6 +378,9 @@ class DocumentExtractor:
                 "Subprocess extraction failed for {}, falling back to in-process: {}",
                 file_path, exc,
             )
+            fallback = DocumentExtractor._fallback_docx(file_path, profile)
+            if fallback is not None:
+                return fallback
             return await DocumentExtractor.extract(file_path, profile)
 
     @staticmethod
@@ -546,6 +559,93 @@ class DocumentExtractor:
             count = len(reader.pages)
             return count if count > 0 else None
         except Exception:
+            return None
+
+    @staticmethod
+    def _fallback_docx(
+        file_path: Union[str, Path],
+        profile: ExtractionProfile,
+    ) -> Optional[ExtractionOutput]:
+        """Extract docx text without kreuzberg's native extension."""
+        path = Path(file_path)
+        if path.suffix.lower() != ".docx":
+            return None
+
+        try:
+            from docx import Document
+
+            document = Document(str(path))
+            lines: list[str] = []
+            for paragraph in document.paragraphs:
+                text = paragraph.text.strip()
+                if text:
+                    lines.append(text)
+
+            tables: list[dict[str, Any]] = []
+            for table_index, table in enumerate(document.tables):
+                table_rows: list[list[str]] = []
+                for row in table.rows:
+                    cells = [cell.text.strip() for cell in row.cells]
+                    if any(cells):
+                        table_rows.append(cells)
+                        lines.append("\t".join(cells))
+                if profile.extract_tables and table_rows:
+                    tables.append({
+                        "page_number": None,
+                        "table_index": table_index,
+                        "rows": table_rows,
+                    })
+
+            content = "\n".join(lines).strip()
+            if not content:
+                return None
+
+            metadata: dict[str, Any] = {}
+            if profile.extract_metadata:
+                props = document.core_properties
+                metadata = {
+                    key: value
+                    for key, value in {
+                        "author": props.author,
+                        "title": props.title,
+                        "subject": props.subject,
+                        "keywords": props.keywords,
+                        "created": props.created.isoformat() if props.created else None,
+                        "modified": props.modified.isoformat() if props.modified else None,
+                    }.items()
+                    if value
+                }
+
+            return ExtractionOutput(
+                content=content,
+                mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                metadata=metadata,
+                tables=tables,
+            )
+        except Exception as exc:
+            logger.debug("python-docx fallback failed for {}: {}", path, exc)
+
+        try:
+            with zipfile.ZipFile(path) as archive:
+                xml_data = archive.read("word/document.xml")
+            root = ET.fromstring(xml_data)
+            namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+            lines = []
+            for paragraph in root.findall(".//w:p", namespace):
+                text = "".join(
+                    node.text or "" for node in paragraph.findall(".//w:t", namespace)
+                ).strip()
+                if text:
+                    lines.append(text)
+            content = "\n".join(lines).strip()
+            if not content:
+                return None
+            return ExtractionOutput(
+                content=content,
+                mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        except Exception as exc:
+            logger.debug("docx xml fallback failed for {}: {}", path, exc)
             return None
 
     @staticmethod

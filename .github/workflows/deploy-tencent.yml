@@ -100,7 +100,7 @@ jobs:
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=5 \
             "${REMOTE_USER}@${TENCENT_HOST}" \
-            "TENCENT_DEPLOY_PATH='$REMOTE_DEPLOY_PATH' GITHUB_SHA='$GITHUB_SHA' GITHUB_REPOSITORY='$GITHUB_REPOSITORY' GH_TOKEN='$GH_TOKEN' bash -s" <<'REMOTE'
+            "TENCENT_DEPLOY_PATH='$REMOTE_DEPLOY_PATH' GITHUB_SHA='$GITHUB_SHA' GITHUB_REF_NAME='$GITHUB_REF_NAME' GITHUB_REPOSITORY='$GITHUB_REPOSITORY' GH_TOKEN='$GH_TOKEN' bash -s" <<'REMOTE'
           set -euo pipefail
 
           DEPLOY_PATH="${TENCENT_DEPLOY_PATH:-$HOME/medipolicyai}"
@@ -131,7 +131,7 @@ jobs:
           ln -sfn ../shared/.env "$DEPLOY_PATH/current/.env"
 
           cd "$DEPLOY_PATH/current"
-          docker compose -f docker-compose.prod.yml build
+          APP_VERSION="${GITHUB_REF_NAME:-${GITHUB_SHA:0:7}}" docker compose -f docker-compose.prod.yml build
           docker compose -f docker-compose.prod.yml up -d --remove-orphans
           docker image prune -f
           rm -f "$ARCHIVE"

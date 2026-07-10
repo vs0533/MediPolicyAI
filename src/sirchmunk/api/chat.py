@@ -79,6 +79,22 @@ _PUBLIC_POLICY_KEYWORDS = (
     "中医", "日间", "失能", "评估", "住院", "处方", "复诊", "待遇",
 )
 
+_PUBLIC_IDENTITY_RE = re.compile(
+    r"^\s*(你是谁|你是什么|你是.*吗|介绍一下你自己|自我介绍|who\s+are\s+you|what\s+are\s+you)\s*[?？。!！]*\s*$",
+    re.IGNORECASE,
+)
+_PUBLIC_CAPABILITY_RE = re.compile(
+    r"^\s*(你能做什么|你可以做什么|你会做什么|能问你什么|怎么用|如何使用|what\s+can\s+you\s+do)\s*[?？。!！]*\s*$",
+    re.IGNORECASE,
+)
+_PUBLIC_GREETING_RE = re.compile(r"^\s*(你好|您好|hi|hello|嗨|在吗)\s*[?？。!！]*\s*$", re.IGNORECASE)
+_PUBLIC_THANKS_RE = re.compile(r"^\s*(谢谢|感谢|多谢|thanks|thank\s+you)\s*[?？。!！]*\s*$", re.IGNORECASE)
+_PUBLIC_CONTEXT_CUE_RE = re.compile(
+    r"(上述|上面|前面|刚才|上一条|上一个|这个|这种|这些|它|其|他们|它们|"
+    r"继续|再说|展开|详细|补充|"
+    r"这项|此项|该政策|该费用|这个政策|这个费用)"
+)
+
 _PUBLIC_POLICY_CHAT_SYSTEM = (
     "你是“政策问答”，一个面向公众的医保政策公共问答服务。"
     "本服务由淄博卫盛科技有限公司开发。"
@@ -93,6 +109,36 @@ _POLICY_DOCUMENT_SUFFIXES = {
     ".doc", ".docx", ".htm", ".html", ".md", ".pdf", ".ppt", ".pptx",
     ".rtf", ".txt", ".xls", ".xlsx",
 }
+
+
+def _public_service_shortcut_response(message: str) -> Optional[str]:
+    """Return canned public-service replies for non-policy lookup questions."""
+    normalized = message.strip()
+    if not normalized:
+        return None
+    if _PUBLIC_IDENTITY_RE.match(normalized):
+        return (
+            "我是政策问答，面向公众提供医保政策咨询、条款解释和办理指引。"
+            "本服务由淄博卫盛科技有限公司开发。"
+        )
+    if _PUBLIC_CAPABILITY_RE.match(normalized):
+        return (
+            "我可以帮助查询和解释医保政策，包括报销范围、异地就医备案、门诊慢特病、"
+            "长期护理保险、定点医药机构协议和医保基金支付规则等问题。"
+        )
+    if _PUBLIC_GREETING_RE.match(normalized):
+        return "您好，我是政策问答。请直接输入想了解的医保政策问题。"
+    if _PUBLIC_THANKS_RE.match(normalized):
+        return "不客气。还有医保政策问题可以继续咨询。"
+    return None
+
+
+def _public_question_needs_history(message: str) -> bool:
+    """Use chat history only when a public-service question looks like a follow-up."""
+    text = message.strip()
+    if not text:
+        return False
+    return bool(_PUBLIC_CONTEXT_CUE_RE.search(text))
 
 
 def _has_readable_policy_documents(paths: List[str]) -> bool:
@@ -1174,6 +1220,11 @@ async def _chat_only(
     so it can maintain context across messages.
     """
     try:
+        if is_public_service_mode():
+            shortcut = _public_service_shortcut_response(message)
+            if shortcut:
+                return shortcut, {}
+
         await manager.send_personal_message(json.dumps({
             "type": "status",
             "stage": "generating",
@@ -1286,6 +1337,11 @@ async def _chat_rag(
     final answer is generated with conversation context.
     """
     sources = {}
+    if is_public_service_mode():
+        shortcut = _public_service_shortcut_response(message)
+        if shortcut:
+            return shortcut, sources
+
     paths, paths_display = _resolve_rag_paths(kb_name)
     if not paths:
         await manager.send_personal_message(json.dumps({
@@ -1656,6 +1712,10 @@ async def chat_websocket(websocket: WebSocket):
             # appending the current user message.
             # ============================================================
             chat_history = _build_chat_history(session_id)
+
+            if is_public_service_mode() and chat_history and not _public_question_needs_history(message):
+                logger.info("[multi-turn] Public-service standalone question — skipping chat history")
+                chat_history = []
 
             if chat_history:
                 envs_for_filter: Dict[str, Any] = get_envs()

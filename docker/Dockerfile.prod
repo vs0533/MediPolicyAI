@@ -6,6 +6,7 @@
 FROM node:20-bookworm-slim AS frontend-builder
 
 ARG NPM_REGISTRY=https://registry.npmmirror.com
+ARG APP_VERSION=local
 
 WORKDIR /build/web
 
@@ -16,6 +17,7 @@ RUN npm config set registry "$NPM_REGISTRY" \
 COPY web/ ./
 ENV NEXT_BUILD_STATIC=true
 ENV NEXT_PUBLIC_API_BASE=""
+ENV NEXT_PUBLIC_APP_VERSION=${APP_VERSION}
 RUN npm run build
 
 # ---------------------------------------------------------------------------
