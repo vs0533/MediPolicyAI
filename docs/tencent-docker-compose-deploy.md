@@ -74,6 +74,19 @@ git push origin v1.0.0
 
 如果只是想验证部署链路，也可以在 GitHub Actions 页面手动运行“部署到腾讯云”workflow。
 
+## 构建加速
+
+生产 Docker 构建默认使用国内镜像源：
+
+```env
+APT_MIRROR=http://mirrors.tencentyun.com/debian
+APT_SECURITY_MIRROR=http://mirrors.tencentyun.com/debian-security
+PYPI_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple
+NPM_REGISTRY=https://registry.npmmirror.com
+```
+
+如果服务器 Docker 还没有配置镜像加速器，首次拉取 `python:3.12-slim-bookworm` 和 `node:20-bookworm-slim` 仍可能较慢。建议在腾讯云服务器的 Docker daemon 配置中添加腾讯云或其他国内 registry mirror。
+
 ## 常用运维命令
 
 ```bash

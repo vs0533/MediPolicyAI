@@ -7,6 +7,10 @@ services:
       args:
         GITHUB_PROXY: ${GITHUB_PROXY:-}
         PRELOAD_EMBEDDING_MODEL: ${PRELOAD_EMBEDDING_MODEL:-false}
+        APT_MIRROR: ${APT_MIRROR:-http://mirrors.tencentyun.com/debian}
+        APT_SECURITY_MIRROR: ${APT_SECURITY_MIRROR:-http://mirrors.tencentyun.com/debian-security}
+        PYPI_INDEX_URL: ${PYPI_INDEX_URL:-https://mirrors.cloud.tencent.com/pypi/simple}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
     container_name: medipolicyai
     restart: unless-stopped
     ports:

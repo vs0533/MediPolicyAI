@@ -5,10 +5,13 @@
 # ---------------------------------------------------------------------------
 FROM node:20-bookworm-slim AS frontend-builder
 
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+
 WORKDIR /build/web
 
 COPY web/package.json web/package-lock.json ./
-RUN npm ci --prefer-offline
+RUN npm config set registry "$NPM_REGISTRY" \
+    && npm ci --prefer-offline
 
 COPY web/ ./
 ENV NEXT_BUILD_STATIC=true
@@ -23,9 +26,14 @@ FROM python:3.12-slim-bookworm AS runtime
 ARG DEBIAN_FRONTEND=noninteractive
 ARG GITHUB_PROXY=""
 ARG PRELOAD_EMBEDDING_MODEL=false
+ARG APT_MIRROR=http://mirrors.tencentyun.com/debian
+ARG APT_SECURITY_MIRROR=http://mirrors.tencentyun.com/debian-security
+ARG PYPI_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple
 
 ENV TZ=Asia/Shanghai
 ENV PYTHONUNBUFFERED=1
+ENV PIP_INDEX_URL=${PYPI_INDEX_URL}
+ENV UV_INDEX_URL=${PYPI_INDEX_URL}
 ENV SIRCHMUNK_WORK_PATH=/data/sirchmunk
 ENV SIRCHMUNK_SERVE_UI=true
 ENV SIRCHMUNK_PUBLIC_SERVICE=true
@@ -33,7 +41,12 @@ ENV SIRCHMUNK_SEARCH_PATHS=/app/policy-docs
 ENV SIRCHMUNK_ALLOWED_PATHS=/app/policy-docs
 ENV EMBEDDING_CACHE_DIR=/data/sirchmunk/.cache/models
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i \
+        -e "s|http://deb.debian.org/debian|${APT_MIRROR}|g" \
+        -e "s|http://deb.debian.org/debian-security|${APT_SECURITY_MIRROR}|g" \
+        -e "s|http://security.debian.org/debian-security|${APT_SECURITY_MIRROR}|g" \
+        /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true \
+    && apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
         curl \
