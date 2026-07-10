@@ -56,29 +56,32 @@ RUN sed -i \
         pandoc \
         poppler-utils \
         procps \
+        ripgrep \
         tesseract-ocr \
         vim \
     && rm -rf /var/lib/apt/lists/*
 
-ARG RG_VERSION=14.1.1
 ARG RGA_VERSION=v0.10.10
 RUN set -eux; \
+    download() { \
+        curl --http1.1 \
+            --retry 5 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            --connect-timeout 20 \
+            --max-time 300 \
+            -fsSL "$1" \
+            -o "$2"; \
+    }; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in \
         amd64) \
-            curl -fsSL "${GITHUB_PROXY}https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/ripgrep_${RG_VERSION}-1_amd64.deb" -o /tmp/rg.deb; \
-            dpkg -i /tmp/rg.deb; \
-            rm /tmp/rg.deb; \
             rga_arch="x86_64-unknown-linux-musl" ;; \
         arm64) \
-            curl -fsSL "${GITHUB_PROXY}https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/ripgrep-${RG_VERSION}-aarch64-unknown-linux-gnu.tar.gz" -o /tmp/rg.tar.gz; \
-            tar -xzf /tmp/rg.tar.gz -C /tmp; \
-            cp "/tmp/ripgrep-${RG_VERSION}-aarch64-unknown-linux-gnu/rg" /usr/local/bin/; \
-            rm -rf /tmp/rg.tar.gz "/tmp/ripgrep-${RG_VERSION}-aarch64-unknown-linux-gnu"; \
             rga_arch="aarch64-unknown-linux-gnu" ;; \
         *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL "${GITHUB_PROXY}https://github.com/phiresky/ripgrep-all/releases/download/${RGA_VERSION}/ripgrep_all-${RGA_VERSION}-${rga_arch}.tar.gz" -o /tmp/rga.tar.gz; \
+    download "${GITHUB_PROXY}https://github.com/phiresky/ripgrep-all/releases/download/${RGA_VERSION}/ripgrep_all-${RGA_VERSION}-${rga_arch}.tar.gz" /tmp/rga.tar.gz; \
     tar -xzf /tmp/rga.tar.gz -C /tmp; \
     cp /tmp/ripgrep_all-*/rga /usr/local/bin/; \
     cp /tmp/ripgrep_all-*/rga-preproc /usr/local/bin/; \
