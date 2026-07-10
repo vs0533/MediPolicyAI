@@ -214,7 +214,7 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
   // --- Settings Logic ---
   const [settings, setSettings] = useState<Settings>({
     theme: "light",
-    language: "en",
+    language: "zh",
   });
 
   const refreshSettings = async () => {
@@ -225,7 +225,7 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
         if (result.success && result.data) {
           const newSettings = {
             theme: result.data.theme || "light",
-            language: result.data.language || "en",
+            language: result.data.language || "zh",
           };
           setSettings(newSettings);
           

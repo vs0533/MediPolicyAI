@@ -131,7 +131,7 @@ def _update_env_file(updates: Dict[str, str]):
 
 class UISettings(BaseModel):
     theme: str = "light"
-    language: str = "en"
+    language: str = "zh"
 
 class EnvironmentVariables(BaseModel):
     SIRCHMUNK_WORK_PATH: Optional[str] = None
@@ -155,7 +155,7 @@ def get_default_ui_settings() -> Dict[str, Any]:
     """Get UI settings from os.environ (backed by .env)."""
     return {
         "theme": os.getenv("UI_THEME", "light"),
-        "language": os.getenv("UI_LANGUAGE", "en"),
+        "language": os.getenv("UI_LANGUAGE", "zh"),
     }
 
 def get_current_env_variables() -> Dict[str, Any]:
