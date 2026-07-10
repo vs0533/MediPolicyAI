@@ -90,7 +90,7 @@ jobs:
         run: |
           REMOTE_USER="${TENCENT_USER:-root}"
           REMOTE_PORT="${TENCENT_PORT:-22}"
-          DEPLOY_PATH="${TENCENT_DEPLOY_PATH:-~/medipolicyai}"
+          REMOTE_DEPLOY_PATH="${TENCENT_DEPLOY_PATH:-}"
           timeout 1800s ssh \
             -p "$REMOTE_PORT" \
             -i ~/.ssh/tencent_key \
@@ -100,9 +100,10 @@ jobs:
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=5 \
             "${REMOTE_USER}@${TENCENT_HOST}" \
-            "DEPLOY_PATH='$DEPLOY_PATH' GITHUB_SHA='$GITHUB_SHA' GITHUB_REPOSITORY='$GITHUB_REPOSITORY' GH_TOKEN='$GH_TOKEN' bash -s" <<'REMOTE'
+            "TENCENT_DEPLOY_PATH='$REMOTE_DEPLOY_PATH' GITHUB_SHA='$GITHUB_SHA' GITHUB_REPOSITORY='$GITHUB_REPOSITORY' GH_TOKEN='$GH_TOKEN' bash -s" <<'REMOTE'
           set -euo pipefail
 
+          DEPLOY_PATH="${TENCENT_DEPLOY_PATH:-$HOME/medipolicyai}"
           ARCHIVE="/tmp/medipolicyai-${GITHUB_SHA}.tar.gz"
           mkdir -p "$DEPLOY_PATH/shared/data" "$DEPLOY_PATH/shared/policy-docs" "$DEPLOY_PATH/releases"
           rm -rf "$DEPLOY_PATH/current.new"
