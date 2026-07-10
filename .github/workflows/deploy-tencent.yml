@@ -50,6 +50,8 @@ jobs:
     runs-on: ubuntu-22.04
     needs: verify
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
     env:
       TENCENT_HOST: ${{ secrets.TENCENT_HOST }}
       SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -57,14 +59,6 @@ jobs:
       TENCENT_PORT: ${{ secrets.TENCENT_PORT }}
       TENCENT_DEPLOY_PATH: ${{ secrets.TENCENT_DEPLOY_PATH }}
     steps:
-      - name: 拉取代码
-        uses: actions/checkout@v4
-
-      - name: 打包源码
-        run: |
-          git archive --format=tar.gz --output="/tmp/medipolicyai-${GITHUB_SHA}.tar.gz" HEAD
-          ls -lh "/tmp/medipolicyai-${GITHUB_SHA}.tar.gz"
-
       - name: 配置 SSH
         run: |
           test -n "$TENCENT_HOST"
@@ -90,30 +84,9 @@ jobs:
             exit 1
           fi
 
-      - name: 上传源码包
-        run: |
-          REMOTE_USER="${TENCENT_USER:-root}"
-          REMOTE_PORT="${TENCENT_PORT:-22}"
-          timeout 180s ssh \
-            -p "$REMOTE_PORT" \
-            -i ~/.ssh/tencent_key \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o ConnectTimeout=15 \
-            -o ServerAliveInterval=10 \
-            -o ServerAliveCountMax=3 \
-            "${REMOTE_USER}@${TENCENT_HOST}" \
-            "cat > /tmp/medipolicyai-${GITHUB_SHA}.tar.gz" \
-            < "/tmp/medipolicyai-${GITHUB_SHA}.tar.gz"
-          ssh \
-            -p "$REMOTE_PORT" \
-            -i ~/.ssh/tencent_key \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            "${REMOTE_USER}@${TENCENT_HOST}" \
-            "ls -lh /tmp/medipolicyai-${GITHUB_SHA}.tar.gz"
-
       - name: 远程部署
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           REMOTE_USER="${TENCENT_USER:-root}"
           REMOTE_PORT="${TENCENT_PORT:-22}"
@@ -127,14 +100,20 @@ jobs:
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=5 \
             "${REMOTE_USER}@${TENCENT_HOST}" \
-            "DEPLOY_PATH='$DEPLOY_PATH' GITHUB_SHA='$GITHUB_SHA' bash -s" <<'REMOTE'
+            "DEPLOY_PATH='$DEPLOY_PATH' GITHUB_SHA='$GITHUB_SHA' GITHUB_REPOSITORY='$GITHUB_REPOSITORY' GH_TOKEN='$GH_TOKEN' bash -s" <<'REMOTE'
           set -euo pipefail
 
           ARCHIVE="/tmp/medipolicyai-${GITHUB_SHA}.tar.gz"
           mkdir -p "$DEPLOY_PATH/shared/data" "$DEPLOY_PATH/shared/policy-docs" "$DEPLOY_PATH/releases"
           rm -rf "$DEPLOY_PATH/current.new"
           mkdir -p "$DEPLOY_PATH/current.new"
-          tar -xzf "$ARCHIVE" -C "$DEPLOY_PATH/current.new"
+          curl -fL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -o "$ARCHIVE" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/tarball/${GITHUB_SHA}"
+          ls -lh "$ARCHIVE"
+          tar -xzf "$ARCHIVE" -C "$DEPLOY_PATH/current.new" --strip-components=1
 
           if [ ! -f "$DEPLOY_PATH/shared/.env" ]; then
             cp "$DEPLOY_PATH/current.new/config/env.production.example" "$DEPLOY_PATH/shared/.env"

@@ -1,6 +1,6 @@
 # 腾讯云 Docker Compose 部署
 
-本部署方案不使用镜像仓库。GitHub Actions 在推送 `v*.*.*` 版本 tag 或手动触发时，通过 SSH 上传源码包到腾讯云服务器，并在服务器本地执行 `docker compose build` 和 `docker compose up -d`。
+本部署方案不使用镜像仓库。GitHub Actions 在推送 `v*.*.*` 版本 tag 或手动触发时，通过 SSH 登录腾讯云服务器，由服务器主动下载当前版本源码包，并在服务器本地执行 `docker compose build` 和 `docker compose up -d`。
 
 ## GitHub Secrets
 
@@ -40,7 +40,7 @@ sudo chown -R 当前部署用户:当前部署用户 /opt/medipolicyai
 
 ## 首次部署
 
-首次运行 workflow 时，如果服务器没有 `/opt/medipolicyai/shared/.env`，会自动生成模板并主动失败。登录服务器补齐 `LLM_API_KEY` 后，重新运行 workflow。
+首次运行 workflow 时，如果服务器没有 `~/medipolicyai/shared/.env`，会自动生成模板并主动失败。登录服务器补齐 `LLM_API_KEY` 后，重新运行 workflow。
 
 ```bash
 ssh root@你的服务器
