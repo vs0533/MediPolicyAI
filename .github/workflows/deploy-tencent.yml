@@ -63,6 +63,7 @@ jobs:
       - name: 打包源码
         run: |
           git archive --format=tar.gz --output="/tmp/medipolicyai-${GITHUB_SHA}.tar.gz" HEAD
+          ls -lh "/tmp/medipolicyai-${GITHUB_SHA}.tar.gz"
 
       - name: 配置 SSH
         run: |
@@ -93,24 +94,38 @@ jobs:
         run: |
           REMOTE_USER="${TENCENT_USER:-root}"
           REMOTE_PORT="${TENCENT_PORT:-22}"
-          scp \
-            -P "$REMOTE_PORT" \
+          timeout 180s ssh \
+            -p "$REMOTE_PORT" \
             -i ~/.ssh/tencent_key \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
-            /tmp/medipolicyai-${GITHUB_SHA}.tar.gz \
-            "${REMOTE_USER}@${TENCENT_HOST}:/tmp/medipolicyai-${GITHUB_SHA}.tar.gz"
+            -o ConnectTimeout=15 \
+            -o ServerAliveInterval=10 \
+            -o ServerAliveCountMax=3 \
+            "${REMOTE_USER}@${TENCENT_HOST}" \
+            "cat > /tmp/medipolicyai-${GITHUB_SHA}.tar.gz" \
+            < "/tmp/medipolicyai-${GITHUB_SHA}.tar.gz"
+          ssh \
+            -p "$REMOTE_PORT" \
+            -i ~/.ssh/tencent_key \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            "${REMOTE_USER}@${TENCENT_HOST}" \
+            "ls -lh /tmp/medipolicyai-${GITHUB_SHA}.tar.gz"
 
       - name: 远程部署
         run: |
           REMOTE_USER="${TENCENT_USER:-root}"
           REMOTE_PORT="${TENCENT_PORT:-22}"
           DEPLOY_PATH="${TENCENT_DEPLOY_PATH:-~/medipolicyai}"
-          ssh \
+          timeout 1800s ssh \
             -p "$REMOTE_PORT" \
             -i ~/.ssh/tencent_key \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=5 \
             "${REMOTE_USER}@${TENCENT_HOST}" \
             "DEPLOY_PATH='$DEPLOY_PATH' GITHUB_SHA='$GITHUB_SHA' bash -s" <<'REMOTE'
           set -euo pipefail
