@@ -79,6 +79,34 @@ _PUBLIC_POLICY_KEYWORDS = (
     "中医", "日间", "失能", "评估", "住院", "处方", "复诊", "待遇",
 )
 
+_POLICY_DOCUMENT_SUFFIXES = {
+    ".doc", ".docx", ".htm", ".html", ".md", ".pdf", ".ppt", ".pptx",
+    ".rtf", ".txt", ".xls", ".xlsx",
+}
+
+
+def _has_readable_policy_documents(paths: List[str]) -> bool:
+    """Return True when at least one readable document exists under *paths*."""
+    for raw_path in paths:
+        path = Path(raw_path)
+        try:
+            if path.is_file():
+                if path.suffix.lower() in _POLICY_DOCUMENT_SUFFIXES and os.access(path, os.R_OK):
+                    return True
+                continue
+            if not path.is_dir():
+                continue
+            for child in path.rglob("*"):
+                if (
+                    child.is_file()
+                    and child.suffix.lower() in _POLICY_DOCUMENT_SUFFIXES
+                    and os.access(child, os.R_OK)
+                ):
+                    return True
+        except OSError:
+            continue
+    return False
+
 
 def _is_transient_llm_error(exc: Exception) -> bool:
     """Return True if *exc* is a transient LLM/network error worth retrying."""
@@ -1265,6 +1293,18 @@ async def _chat_rag(
         message_text = (
             "政策知识库目录当前不可访问。请给服务进程授予 Documents 目录访问权限，"
             "或将医保政策文档移动到项目可读目录后更新 SIRCHMUNK_SEARCH_PATHS。"
+        )
+        await manager.send_personal_message(json.dumps({
+            "type": "error",
+            "message": message_text,
+        }, ensure_ascii=False), websocket)
+        return message_text, sources
+
+    if not _has_readable_policy_documents(paths):
+        message_text = (
+            "医保政策知识库目录当前为空或没有可读取的政策文档。"
+            "请将 .docx、.pdf、.xlsx、.txt 等政策文件上传到生产服务器的 "
+            "shared/policy-docs 目录后再查询。"
         )
         await manager.send_personal_message(json.dumps({
             "type": "error",

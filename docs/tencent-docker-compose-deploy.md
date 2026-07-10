@@ -61,6 +61,12 @@ LLM_MODEL_NAME=gpt-5.2
 $HOME/medipolicyai/shared/policy-docs
 ```
 
+注意：本地 `policy-docs/` 目录默认被 `.gitignore` 忽略，不会进入 GitHub tag 源码包，也不会被 CI 自动上传到服务器。首次上线或更新知识库时，需要单独把政策文档上传到服务器的 `shared/policy-docs/` 目录，例如：
+
+```bash
+scp -r policy-docs/* root@你的服务器:"$HOME/medipolicyai/shared/policy-docs/"
+```
+
 然后重新运行 GitHub Actions 的“部署到腾讯云”workflow。
 
 ## 发布新版本
